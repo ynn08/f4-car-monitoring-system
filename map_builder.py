@@ -1,202 +1,250 @@
 import cv2
 import numpy as np
 
-
 class LocalMapBuilder:
-    def __init__(self, pixels_per_meter=50, initial_size=4000):
+    def __init__(self, 
+                 pixels_per_meter=33,
+                 initial_size=4000,
+                 blend_decay=0.05,
+                 min_weight=0.1,
+                 use_distance_weighting=True):
+        """
+        pixels_per_meter: масштаб карты (пикселей на метр)
+        initial_size: начальный размер холста карты
+        blend_decay: коэффициент затухания старых кадров (0.0-1.0)
+        min_weight: минимальный вес для обновления пикселя
+        use_distance_weighting: использовать взвешивание по расстоянию от машины
+        """
         self.ppm = pixels_per_meter
-        self.offset_x = initial_size // 2
-        self.offset_y = initial_size // 2
-        self.map_canvas = np.zeros((initial_size, initial_size, 3), dtype=np.uint8) + 128
-        self.mask_canvas = np.zeros((initial_size, initial_size), dtype=np.uint8)
-        self.count_canvas = np.zeros((initial_size, initial_size), dtype=np.float32)  # Для усреднения
-        self.sum_canvas = np.zeros((initial_size, initial_size, 3), dtype=np.float32)  # Для усреднения
+        self.initial_size = initial_size
+        self.blend_decay = blend_decay
+        self.min_weight = min_weight
+        self.use_distance_weighting = use_distance_weighting
+        
+        # Инициализация карты
+        self.map = np.zeros((initial_size, initial_size, 3), dtype=np.uint8)
+        self.weight_map = np.zeros((initial_size, initial_size), dtype=np.float32)
+        
+        # Центр карты (начальная позиция машины)
+        self.center_x = initial_size // 2
+        self.center_y = initial_size // 2
+        
+        # История поз
         self.poses = []
+        self.current_pose = np.array([0.0, 0.0, 0.0])
         
-    def _expand_canvas(self, min_size_needed):
-        """Расширяет холст если нужно"""
-        current_size = self.map_canvas.shape[0]
+        # Границы карты для расширения
+        self.map_bounds = {
+            'min_x': initial_size // 2,
+            'max_x': initial_size // 2,
+            'min_y': initial_size // 2,
+            'max_y': initial_size // 2
+        }
         
-        if min_size_needed <= current_size:
-            return
-        
-        new_size = max(current_size * 2, min_size_needed)
-        print(f"Expanding canvas from {current_size} to {new_size} pixels")
-        
-        new_map = np.zeros((new_size, new_size, 3), dtype=np.uint8) + 128
-        new_mask = np.zeros((new_size, new_size), dtype=np.uint8)
-        new_sum = np.zeros((new_size, new_size, 3), dtype=np.float32)
-        new_count = np.zeros((new_size, new_size), dtype=np.float32)
-        
-        start_x = (new_size - current_size) // 2
-        start_y = (new_size - current_size) // 2
-        
-        new_map[start_y:start_y+current_size, start_x:start_x+current_size] = self.map_canvas
-        new_mask[start_y:start_y+current_size, start_x:start_x+current_size] = self.mask_canvas
-        new_sum[start_y:start_y+current_size, start_x:start_x+current_size] = self.sum_canvas
-        new_count[start_y:start_y+current_size, start_x:start_x+current_size] = self.count_canvas
-        
-        self.offset_x += start_x
-        self.offset_y += start_y
-        
-        self.map_canvas = new_map
-        self.mask_canvas = new_mask
-        self.sum_canvas = new_sum
-        self.count_canvas = new_count
-    
-    def _create_validity_mask(self, image):
+        # Кэш весовых масок
+        self._distance_weight_cache = {}
+
+    def _create_distance_weight_mask(self, shape, car_position_in_bev):
         """
-        Создаёт маску валидных пикселей (исключает черные области)
+        Создает маску весов: ближе к машине = больше вес, дальше = меньше вес.
+        Это решает проблему с искажениями IPM на дальних дистанциях.
         """
-        if len(image.shape) == 3:
-            gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-        else:
-            gray = image
+        h, w = shape[:2]
+        cache_key = (h, w, int(car_position_in_bev[0]), int(car_position_in_bev[1]))
         
-        # Черные области = 0, валидные = > 10 (с запасом)
-        valid_mask = gray > 10
+        if cache_key in self._distance_weight_cache:
+            return self._distance_weight_cache[cache_key]
         
-        # Морфологическая операция для удаления шума
-        kernel = np.ones((3, 3), np.uint8)
-        valid_mask = cv2.morphologyEx(valid_mask.astype(np.uint8), cv2.MORPH_CLOSE, kernel)
+        y, x = np.ogrid[:h, :w]
+        center_x, center_y = car_position_in_bev
         
-        return valid_mask.astype(np.uint8) * 255
-    
-    def add_frame(self, bev_image, vehicle_pose, use_averaging=True):
+        # Евклидово расстояние от позиции машины
+        distances = np.sqrt((x - center_x)**2 + (y - center_y)**2)
+        
+        # Гауссово затухание весов
+        max_dist = max(h, w) * 0.8
+        weights = np.exp(-(distances**2) / (2 * (max_dist * 0.3)**2))
+        
+        # Сильно уменьшаем вес для самых дальних пикселей (там IPM неточен)
+        far_mask = distances > max_dist * 0.7
+        weights[far_mask] *= 0.3
+        
+        self._distance_weight_cache[cache_key] = weights
+        return weights
+
+    def _expand_map_if_needed(self, new_bounds):
+        """Расширяет карту, если новые данные выходят за границы"""
+        margin = 500
+        
+        new_min_x = min(self.map_bounds['min_x'], new_bounds['min_x']) - margin
+        new_max_x = max(self.map_bounds['max_x'], new_bounds['max_x']) + margin
+        new_min_y = min(self.map_bounds['min_y'], new_bounds['min_y']) - margin
+        new_max_y = max(self.map_bounds['max_y'], new_bounds['max_y']) + margin
+        
+        current_h, current_w = self.map.shape[:2]
+        new_h = new_max_y - new_min_y
+        new_w = new_max_x - new_min_x
+        
+        if new_h > current_h or new_w > current_w:
+            print(f"🔄 Expanding map: {current_w}x{current_h} -> {new_w}x{new_h}")
+            
+            new_map = np.zeros((new_h, new_w, 3), dtype=np.uint8)
+            new_weight_map = np.zeros((new_h, new_w), dtype=np.float32)
+            
+            # Смещение для копирования старых данных
+            offset_x = self.center_x - new_min_x
+            offset_y = self.center_y - new_min_y
+            
+            new_map[offset_y:offset_y+current_h, offset_x:offset_x+current_w] = self.map
+            new_weight_map[offset_y:offset_y+current_h, offset_x:offset_x+current_w] = self.weight_map
+            
+            self.map = new_map
+            self.weight_map = new_weight_map
+            self.center_x = offset_x
+            self.center_y = offset_y
+            
+            self.map_bounds = {
+                'min_x': new_min_x,
+                'max_x': new_max_x,
+                'min_y': new_min_y,
+                'max_y': new_max_y
+            }
+
+    def _pose_to_map_coords(self, pose):
+        """Конвертирует позу из пикселей BEV в координаты карты"""
+        map_x = self.center_x + pose[0]
+        map_y = self.center_y + pose[1]
+        theta = pose[2]
+        return map_x, map_y, theta
+
+    def add_frame(self, bev_image, pose):
         """
-        Добавляет кадр на карту
-        
-        Args:
-            bev_image: IPM изображение
-            vehicle_pose: [x, y, theta] в метрах и радианах
-            use_averaging: Если True, использует усреднение вместо blending
+        Добавляет кадр на карту с учетом веса и позиции
         """
-        x, y, theta = vehicle_pose
+        self.poses.append(pose.copy())
+        
         h, w = bev_image.shape[:2]
+        map_x, map_y, theta = self._pose_to_map_coords(pose)
         
-        # Проверяем и расширяем холст при необходимости
-        margin = max(w, h)
-        center_x_est = int(x * self.ppm + self.offset_x)
-        center_y_est = int(-y * self.ppm + self.offset_y)
-        
-        min_x = center_x_est - w//2 - margin
-        max_x = center_x_est + w//2 + margin
-        min_y = center_y_est - h//2 - margin
-        max_y = center_y_est + h//2 + margin
-        
-        required_size = max(max_x, max_y, self.map_canvas.shape[0])
-        self._expand_canvas(required_size)
-        
-        # Пересчитываем центр после расширения
-        center_x = int(x * self.ppm + self.offset_x)
-        center_y = int(-y * self.ppm + self.offset_y)
-        
-        # Поворот BEV кадра согласно ориентации автомобиля
+        # 1. Поворачиваем BEV согласно ориентации машины
         rotation_matrix = cv2.getRotationMatrix2D((w//2, h//2), np.degrees(theta), 1.0)
-        rotated_bev = cv2.warpAffine(bev_image, rotation_matrix, (w, h))
+        bev_rotated = cv2.warpAffine(bev_image, rotation_matrix, (w, h), 
+                                     borderMode=cv2.BORDER_REFLECT)
         
-        # Создаём маску валидных пикселей (исключаем черные зоны)
-        validity_mask = self._create_validity_mask(rotated_bev)
-        rotated_mask = cv2.warpAffine(
-            np.ones((h, w), dtype=np.uint8) * 255, 
-            rotation_matrix, (w, h)
-        )
+        # 2. Создаем маску весов
+        car_pos_in_bev = (w // 2, int(h * 0.85))
         
-        # Объединяем маски
-        combined_mask = cv2.bitwise_and(validity_mask, rotated_mask)
-        
-        # Координаты ROI
-        x1, x2 = center_x - w//2, center_x + w//2
-        y1, y2 = center_y - h//2, center_y + h//2
-        
-        # Проверка границ
-        if (x1 < 0 or x2 > self.map_canvas.shape[1] or
-            y1 < 0 or y2 > self.map_canvas.shape[0]):
-            print(f"Warning: Frame exceeds boundaries. x1={x1}, x2={x2}, y1={y1}, y2={y2}")
-            return
-        
-        # Нормализуем маски
-        blend_mask = combined_mask > 0
-        
-        if not np.any(blend_mask):
-            return  # Нет валидных пикселей
-        
-        if use_averaging:
-            # === УСРЕДНЕНИЕ (лучше для карты) ===
-            roi_sum = self.sum_canvas[y1:y2, x1:x2]
-            roi_count = self.count_canvas[y1:y2, x1:x2]
-            
-            # Добавляем новые данные по каналам
-            for c in range(3):
-                roi_sum[:, :, c][blend_mask] += rotated_bev[:, :, c][blend_mask].astype(np.float32)
-            
-            roi_count[blend_mask] += 1
-            
-            # Обновляем карту усреднением
-            valid_count = roi_count > 0
-            for c in range(3):
-                self.map_canvas[y1:y2, x1:x2][:, :, c][valid_count] = (
-                    roi_sum[:, :, c][valid_count] / roi_count[valid_count]
-                ).astype(np.uint8)
-            
-            self.sum_canvas[y1:y2, x1:x2] = roi_sum
-            self.count_canvas[y1:y2, x1:x2] = roi_count
+        if self.use_distance_weighting:
+            distance_weights = self._create_distance_weight_mask(bev_image.shape, car_pos_in_bev)
         else:
-            # === BLENDING (старый метод) ===
-            roi_map = self.map_canvas[y1:y2, x1:x2]
-            alpha = 0.5  # Более консервативное смешивание
-            
-            blended = cv2.addWeighted(roi_map, 1-alpha, rotated_bev, alpha, 0)
-            
-            # Копируем только валидные пиксели
-            for c in range(3):
-                roi_map[:, :, c][blend_mask] = blended[:, :, c][blend_mask]
-            
-            self.map_canvas[y1:y2, x1:x2] = roi_map
+            distance_weights = np.ones((h, w), dtype=np.float32)
         
-        # Обновляем маску заполненности
-        self.mask_canvas[y1:y2, x1:x2] = cv2.bitwise_or(
-            self.mask_canvas[y1:y2, x1:x2], 
-            combined_mask
-        )
+        # 3. Маска валидных пикселей (убираем черные края IPM)
+        validity_mask = (bev_rotated[:,:,0] > 10) | (bev_rotated[:,:,1] > 10) | (bev_rotated[:,:,2] > 10)
+        validity_mask = validity_mask.astype(np.float32)
         
-        self.poses.append(vehicle_pose)
+        # 4. Комбинируем веса
+        frame_weights = distance_weights * validity_mask
         
+        # 5. Вычисляем область на карте для вставки
+        # Машина в BEV находится внизу (0.85 высоты), это должно совпадать с map_x, map_y
+        offset_x = int(map_x - w // 2)
+        offset_y = int(map_y - int(h * 0.85))
+        
+        # 6. Проверяем и расширяем карту
+        new_bounds = {
+            'min_x': offset_x,
+            'max_x': offset_x + w,
+            'min_y': offset_y,
+            'max_y': offset_y + h
+        }
+        self._expand_map_if_needed(new_bounds)
+        
+        # 7. Корректируем оффсеты после расширения
+        offset_x = int(map_x - w // 2)
+        offset_y = int(map_y - int(h * 0.85))
+        
+        # 8. Определяем область пересечения (ИСПРАВЛЕНО)
+        map_h, map_w = self.map.shape[:2]
+        
+        # Координаты в источнике (кадр BEV)
+        src_x_start = max(0, -offset_x)
+        src_y_start = max(0, -offset_y)
+        src_x_end = min(w, map_w - offset_x)
+        src_y_end = min(h, map_h - offset_y)
+        
+        # Координаты в назначении (Карта) - 🔥 ДОБАВЛЕНО ОПРЕДЕЛЕНИЕ
+        dst_x_start = max(0, offset_x)
+        dst_y_start = max(0, offset_y)
+        dst_x_end = min(map_w, offset_x + w)
+        dst_y_end = min(map_h, offset_y + h)
+        
+        if src_x_end <= src_x_start or src_y_end <= src_y_start:
+            return  # Кадр вне границ карты
+        
+        # 9. Извлекаем области
+        frame_region = bev_rotated[src_y_start:src_y_end, src_x_start:src_x_end]
+        weight_region = frame_weights[src_y_start:src_y_end, src_x_start:src_x_end]
+        map_region = self.map[dst_y_start:dst_y_end, dst_x_start:dst_x_end]
+        weight_map_region = self.weight_map[dst_y_start:dst_y_end, dst_x_start:dst_x_end]
+        
+        # 10. Затухание старых весов
+        self.weight_map *= (1.0 - self.blend_decay)
+        # Обновляем region после затухания глобальной карты
+        weight_map_region = self.weight_map[dst_y_start:dst_y_end, dst_x_start:dst_x_end]
+        
+        # 11. Смешивание с весами
+        new_weights = weight_map_region + weight_region
+        new_weights = np.maximum(new_weights, self.min_weight)
+        
+        old_weight_ratio = weight_map_region / new_weights
+        new_weight_ratio = weight_region / new_weights
+        
+        # 12. Обновляем карту (Alpha Blending)
+        for c in range(3):
+            map_region[:,:,c] = (
+                map_region[:,:,c].astype(np.float32) * old_weight_ratio +
+                frame_region[:,:,c].astype(np.float32) * new_weight_ratio
+            ).astype(np.uint8)
+        
+        self.map[dst_y_start:dst_y_end, dst_x_start:dst_x_end] = map_region
+        self.weight_map[dst_y_start:dst_y_end, dst_x_start:dst_x_end] = new_weights
+        
+        self.current_pose = pose
+
     def get_map(self, crop_to_content=True):
+        """Возвращает итоговую карту"""
         if crop_to_content:
-            coords = cv2.findNonZero(self.mask_canvas)
-            if coords is not None:
-                x, y, w, h = cv2.boundingRect(coords)
-                return self.map_canvas[y:y+h, x:x+w]
-        return self.map_canvas
+            valid_mask = self.weight_map > self.min_weight
+            if np.any(valid_mask):
+                coords = np.argwhere(valid_mask)
+                y_min, x_min = coords.min(axis=0)
+                y_max, x_max = coords.max(axis=0)
+                
+                margin = 50
+                y_min = max(0, y_min - margin)
+                x_min = max(0, x_min - margin)
+                y_max = min(self.map.shape[0], y_max + margin)
+                x_max = min(self.map.shape[1], x_max + margin)
+                
+                return self.map[y_min:y_max, x_min:x_max].copy()
+        
+        return self.map.copy()
 
     def save_map(self, path):
-        cv2.imwrite(path, self.get_map())
-        
-    def draw_trajectory(self, color=(0, 0, 255), thickness=2):
-        map_img = self.get_map().copy()
-        if len(self.poses) < 2:
-            return map_img
-            
-        points = []
-        for x, y, _ in self.poses:
-            px = int(x * self.ppm + self.offset_x)
-            py = int(-y * self.ppm + self.offset_y)
-            coords = cv2.findNonZero(self.mask_canvas)
-            if coords is not None:
-                ox, oy, _, _ = cv2.boundingRect(coords)
-                px -= ox
-                py -= oy
-            points.append([px, py])
-        
-        points = np.array(points, dtype=np.int32)
-        cv2.polylines(map_img, [points], False, color, thickness)
-        return map_img
-    
-    def reset(self):
-        """Сбросить карту"""
-        self.map_canvas = np.zeros_like(self.map_canvas) + 128
-        self.mask_canvas = np.zeros_like(self.mask_canvas)
-        self.sum_canvas = np.zeros_like(self.sum_canvas)
-        self.count_canvas = np.zeros_like(self.count_canvas)
-        self.poses = []
+        """Сохраняет карту в файл"""
+        map_to_save = self.get_map(crop_to_content=True)
+        cv2.imwrite(path, map_to_save)
+        print(f"💾 Map saved: {path} ({map_to_save.shape[1]}x{map_to_save.shape[0]})")
+
+    def get_trajectory(self):
+        """Возвращает траекторию в координатах карты"""
+        trajectory = []
+        for pose in self.poses:
+            map_x, map_y, _ = self._pose_to_map_coords(pose)
+            trajectory.append((map_x, map_y))
+        return np.array(trajectory)
+
+    def clear_cache(self):
+        """Очищает кэш весовых масок"""
+        self._distance_weight_cache.clear()

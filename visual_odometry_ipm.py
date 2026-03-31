@@ -1,149 +1,243 @@
 import cv2
 import numpy as np
 
-
 class VisualOdometryIPM:
-    def __init__(self, max_features=3000, min_matches=50, ransac_thresh=5.0):
-        self.detector = cv2.ORB_create(nfeatures=max_features, edgeThreshold=10)
-        self.bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
+    def __init__(self, 
+                 nfeatures=2000, 
+                 edge_threshold=31, 
+                 patch_size=31, 
+                 fast_threshold=20,
+                 use_telemetry=False,
+                 debug_mode=False):
         
-        self.prev_desc = None
+        self.detector = cv2.ORB_create(
+            nfeatures=nfeatures, 
+            edgeThreshold=edge_threshold, 
+            patchSize=patch_size, 
+            fastThreshold=fast_threshold
+        )
+        
+        self.matcher = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=False)
+        
         self.prev_kp = None
-        self.prev_pos = np.array([0.0, 0.0, 0.0])
-        self.motion_buffer = []
-        self.smoothing_window = 3  # Уменьшено для лучшей реакции
+        self.prev_desc = None
+        self.prev_frame = None
         
-        self.min_matches = min_matches
-        self.ransac_thresh = ransac_thresh
-        self.frame_skip = 0  # Пропуск кадров для стабильности
+        self.x = 0.0
+        self.y = 0.0
+        self.theta = 0.0
         
-    def _detect_features(self, image):
+        self.use_telemetry = use_telemetry
+        self.debug_mode = debug_mode
+        self.frame_count = 0
+        
+        self.ransac_reproj_threshold = 3.0
+        self.min_matches = 10
+        
+        # Для статистики
+        self.stats = {
+            'total_frames': 0,
+            'successful_matches': 0,
+            'avg_matches': 0,
+            'total_matches': 0
+        }
+
+    def _detect_features(self, image, mask=None):
         if len(image.shape) == 3:
             gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
         else:
             gray = image
         
-        # Убираем черные края из рассмотрения
-        mask = gray > 10
-        # 600 400
-        # 338 329
-        # 389 386
-        mask[329:386, 338:390] = False
-        mask[352:370, 385:410] = False
-
+        if mask is None:
+            mask = gray > 10
+        
         kp, desc = self.detector.detectAndCompute(gray, mask=mask.astype(np.uint8))
+        return kp, desc, gray
 
-        result = cv2.bitwise_and(gray, gray, mask=mask.astype(np.uint8))
-        # cv2.imshow('Result' + str(random.randint(0, 1000)), result)
-        img_with_kp = cv2.drawKeypoints(gray, kp, None, color=(0, 255, 0))
-        # cv2.imshow('img_with_kp' + str(random.randint(0, 1000)), img_with_kp)
-        # cv2.waitKey(0)
-        # cv2.destroyAllWindows()
+    def _get_car_mask(self, shape):
+        """Создает маску, исключающую машину из кадра BEV"""
+        h, w = shape[:2]
+        mask = np.ones((h, w), dtype=np.uint8)
         
+        # На основе вашего изображения - машина внизу по центру
+        cx, cy = w // 2, int(h * 0.92)
+        car_radius = int(min(w, h) * 0.06)
         
+        # Круглая маска для машины
+        cv2.circle(mask, (cx, cy), car_radius, 0, -1)
         
-        return kp, desc
+        # Дополнительно убираем нижнюю часть кадра (там часто артефакты IPM)
+        mask[int(h * 0.85):, :] = 0
+        
+        return mask
 
-    def update(self, bev_image, dt=0.1):
-        self.frame_skip += 1
+    def _estimate_motion(self, kp1, desc1, kp2, desc2):
+        if desc1 is None or desc2 is None or len(kp1) < 5 or len(kp2) < 5:
+            return None, None
+
+        matches = self.matcher.knnMatch(desc1, desc2, k=2)
         
-        kp, desc = self._detect_features(bev_image)
-        if self.prev_desc is None:
-            self.prev_kp, self.prev_desc = kp, desc
-            return self.prev_pos.copy()
+        good_matches = []
+        for m, n in matches:
+            if m.distance < 0.75 * n.distance:
+                good_matches.append(m)
         
-        # Пропускаем каждый 2-й кадр для стабильности
-        if self.frame_skip < 2:
-            return self.prev_pos.copy()
-        self.frame_skip = 0
-            
-        if desc is None or len(kp) < self.min_matches:
-            return self._predict_motion(dt)
+        if len(good_matches) < self.min_matches:
+            return None, good_matches
+
+        pts1 = np.float32([kp1[m.queryIdx].pt for m in good_matches]).reshape(-1, 1, 2)
+        pts2 = np.float32([kp2[m.trainIdx].pt for m in good_matches]).reshape(-1, 1, 2)
+
+        M, mask = cv2.estimateAffinePartial2D(pts1, pts2, method=cv2.RANSAC, 
+                                              ransacReprojThreshold=self.ransac_reproj_threshold)
         
-        matches = self.bf.match(self.prev_desc, desc)
-        matches = sorted(matches, key=lambda x: x.distance)
+        if M is None:
+            return None, good_matches
+
+        return M, good_matches
+
+    def _matrix_to_delta(self, M):
+        dx = M[0, 2]
+        dy = M[1, 2]
+        angle = np.arctan2(M[1, 0], M[0, 0])
+        return dx, dy, angle
+
+    def create_debug_image(self, frame1, frame2, kp1, kp2, matches, M=None):
+        """Создает отладочное изображение с ключевыми точками и матчами"""
         
-        # Берём только лучшие совпадения
-        matches = matches[:min(200, len(matches))]
-        
-        if len(matches) < self.min_matches:
-            return self._predict_motion(dt)
-            
-        prev_pts = np.float32([self.prev_kp[m.queryIdx].pt for m in matches]).reshape(-1, 1, 2)
-        curr_pts = np.float32([kp[m.trainIdx].pt for m in matches]).reshape(-1, 1, 2)
-        
-        H, mask = cv2.findHomography(prev_pts, curr_pts, cv2.RANSAC, self.ransac_thresh)
-        
-        if H is None:
-            return self._predict_motion(dt)
-        
-        # Считаем количество инлайеров
-        inlier_ratio = np.sum(mask) / len(mask)
-        if inlier_ratio < 0.3:  # Мало инлайеров - ненадёжно
-            return self._predict_motion(dt)
-            
-        dx, dy, dtheta = self._decompose_homography(H, prev_pts, curr_pts, mask)
-        
-        # Ограничиваем максимальное движение между кадрами
-        max_movement = 2.0  # метра
-        max_rotation = 0.3  # радиан (~17 градусов)
-        
-        dx = np.clip(dx, -max_movement, max_movement)
-        dy = np.clip(dy, -max_movement, max_movement)
-        dtheta = np.clip(dtheta, -max_rotation, max_rotation)
-        
-        smoothed_dtheta = self._smooth_motion(dtheta, dt)
-        
-        new_x = self.prev_pos[0] + dx * np.cos(self.prev_pos[2]) - dy * np.sin(self.prev_pos[2])
-        new_y = self.prev_pos[1] + dx * np.sin(self.prev_pos[2]) + dy * np.cos(self.prev_pos[2])
-        new_theta = self.prev_pos[2] + smoothed_dtheta
-        
-        self.prev_pos = np.array([new_x, new_y, new_theta])
-        self.prev_kp, self.prev_desc = kp, desc
-        
-        return self.prev_pos.copy()
-    
-    def _decompose_homography(self, H, prev_pts, curr_pts, mask):
-        H = H / H[2, 2]
-        theta = np.arctan2(H[1, 0], H[0, 0])
-        
-        if mask is not None:
-            inlier_prev = prev_pts[mask.ravel() == 1]
-            inlier_curr = curr_pts[mask.ravel() == 1]
-            if len(inlier_prev) > 0:
-                center_prev = np.mean(inlier_prev, axis=0)
-                center_curr = np.mean(inlier_curr, axis=0)
-                dx = center_curr[0, 0] - center_prev[0, 0]
-                dy = center_curr[0, 1] - center_prev[0, 1]
-            else:
-                dx, dy = H[0, 2], H[1, 2]
+        # Конвертируем в BGR если нужно
+        if len(frame1.shape) == 2:
+            img1 = cv2.cvtColor(frame1, cv2.COLOR_GRAY2BGR)
+            img2 = cv2.cvtColor(frame2, cv2.COLOR_GRAY2BGR)
         else:
-            dx, dy = H[0, 2], H[1, 2]
+            img1 = frame1.copy()
+            img2 = frame2.copy()
+        
+        # Рисуем ключевые точки
+        kp1_img = cv2.drawKeypoints(img1, kp1, None, color=(0, 255, 0), flags=0)
+        kp2_img = cv2.drawKeypoints(img2, kp2, None, color=(0, 255, 0), flags=0)
+        
+        # Рисуем матчи
+        if matches:
+            match_img = cv2.drawMatches(
+                img1, kp1, img2, kp2, matches[:50],  # Показываем первые 50 матчей
+                None,
+                matchColor=(0, 255, 0),
+                singlePointColor=(255, 0, 0),
+                flags=2
+            )
+        else:
+            match_img = np.hstack([img1, img2])
+            cv2.putText(match_img, "NO MATCHES", (50, 50), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+        
+        # Добавляем статистику
+        n_matches = len(matches) if matches else 0
+        info_text = [
+            f"Frame: {self.frame_count}",
+            f"KP1: {len(kp1)}",
+            f"KP2: {len(kp2)}",
+            f"Matches: {n_matches}",
+            f"Success: {self.stats['successful_matches']}/{self.stats['total_frames']}",
+        ]
+        
+        if M is not None:
+            dx, dy, angle = self._matrix_to_delta(M)
+            info_text.extend([
+                f"dx: {dx:.1f} px",
+                f"dy: {dy:.1f} px",
+                f"dtheta: {np.degrees(angle):.2f} deg",
+            ])
+        
+        y_offset = 30
+        for text in info_text:
+            cv2.putText(match_img, text, (10, y_offset), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 1)
+            y_offset += 25
+        
+        return match_img, kp1_img, kp2_img
+
+    def update(self, bev_image, telemetry=None):
+        self.frame_count += 1
+        self.stats['total_frames'] += 1
+        
+        car_mask = self._get_car_mask(bev_image.shape)
+        current_kp, current_desc, current_gray = self._detect_features(bev_image, mask=car_mask)
+        
+        dx, dy, dtheta = 0.0, 0.0, 0.0
+        confidence = 0.0
+        M = None
+        matches = None
+        
+        debug_data = None
+
+        if self.prev_desc is not None:
+            M, matches = self._estimate_motion(self.prev_kp, self.prev_desc, current_kp, current_desc)
             
-        return dx, dy, theta
-    
-    def _smooth_motion(self, dtheta, dt):
-        angular_vel = dtheta / dt if dt > 0 else 0
-        self.motion_buffer.append(angular_vel)
-        if len(self.motion_buffer) > self.smoothing_window:
-            self.motion_buffer.pop(0)
-        avg_vel = np.median(self.motion_buffer)
-        return avg_vel * dt
-    
-    def _predict_motion(self, dt):
-        if len(self.motion_buffer) > 0:
-            last_vel = self.motion_buffer[-1]
-            dtheta = last_vel * dt
-            dx = 0.5 * dt
-            new_x = self.prev_pos[0] + dx * np.cos(self.prev_pos[2])
-            new_y = self.prev_pos[1] + dx * np.sin(self.prev_pos[2])
-            new_theta = self.prev_pos[2] + dtheta
-            self.prev_pos = np.array([new_x, new_y, new_theta])
-        return self.prev_pos.copy()
+            if M is not None:
+                dx, dy, dtheta = self._matrix_to_delta(M)
+                print(dx, dy, dtheta)
+                n_matches = len(matches)
+                confidence = min(1.0, n_matches / 50.0)
+                self.stats['successful_matches'] += 1
+                self.stats['total_matches'] += n_matches
+                self.stats['avg_matches'] = self.stats['total_matches'] / self.stats['successful_matches']
+            else:
+                confidence = 0.0
+        
+        if telemetry and self.use_telemetry:
+            ppm = 50/0
+            dist_m = telemetry.get('speed', 0) * telemetry.get('dt', 1/30)
+            dist_px = dist_m * ppm
+            
+            tel_dy = dist_px
+            tel_dx = 0.0
+            tel_dtheta = telemetry.get('yaw_rate', 0) * telemetry.get('dt', 1/30)
+            
+            if confidence > 0.3:
+                dtheta = 0.7 * dtheta + 0.3 * tel_dtheta
+                dy = 0.4 * dy + 0.6 * tel_dy
+            else:
+                dx, dy, dtheta = tel_dx, tel_dy, tel_dtheta
+
+        cos_t = np.cos(self.theta)
+        sin_t = np.sin(self.theta)
+        
+        global_dx = (-dx * cos_t + dy * sin_t)
+        global_dy = (-dx * sin_t - dy * cos_t)
+        
+        self.x += global_dx
+        self.y += global_dy
+        self.theta += dtheta
+        
+        # Сохраняем для отладки
+        if self.debug_mode and self.prev_frame is not None:
+            debug_data = self.create_debug_image(
+                self.prev_frame, current_gray, 
+                self.prev_kp, current_kp, 
+                matches, M
+            )
+        
+        self.prev_kp = current_kp
+        self.prev_desc = current_desc
+        self.prev_frame = current_gray
+        
+        return np.array([self.x, self.y, self.theta]), debug_data
+
+    def get_stats(self):
+        return self.stats
 
     def reset(self):
-        self.prev_desc = None
         self.prev_kp = None
-        self.prev_pos = np.array([0.0, 0.0, 0.0])
-        self.motion_buffer = []
-        self.frame_skip = 0
+        self.prev_desc = None
+        self.prev_frame = None
+        self.x = 0.0
+        self.y = 0.0
+        self.theta = 0.0
+        self.frame_count = 0
+        self.stats = {
+            'total_frames': 0,
+            'successful_matches': 0,
+            'avg_matches': 0,
+            'total_matches': 0
+        }
