@@ -59,7 +59,7 @@ def build_map_from_video_4points(video_path,
     car_size = (1.47, 2.80)
     scale_koef = 0.0583333
     rect_size = (bev_width * scale_koef, bev_height * scale_koef * car_size[1] / car_size[0])
-    rect_left_up_koef = (0.5, 0.7)
+    rect_left_up_koef = (0.4, 0.7)
     rect_left_up_pos = (bev_width * rect_left_up_koef[0], bev_height * rect_left_up_koef[1])
 
     dst_pts = np.float32([
@@ -71,10 +71,10 @@ def build_map_from_video_4points(video_path,
 
     ipm = IPM_4Points(src_pts, dst_pts, output_size=(bev_width, bev_height))
     builder = LocalMapBuilder(
-        pixels_per_meter=33,      # Попробуйте 30-40 для калибровки
-        initial_size=5000,        # Увеличил запас
+        pixels_per_meter=33,
+        initial_size=5000,
         blend_decay=0.05,
-        use_distance_weighting=True
+        use_distance_weighting=True,
     )
     
     use_telemetry = telemetry_path is not None
@@ -121,7 +121,7 @@ def build_map_from_video_4points(video_path,
             distance_weights = vo._get_car_mask(bev.shape)  # Для примера
             weight_viz = (distance_weights * 255).astype(np.uint8)
             weight_viz = cv2.applyColorMap(weight_viz, cv2.COLORMAP_JET)
-            cv2.imshow("Distance Weights", weight_viz)
+            # cv2.imshow("Distance Weights", weight_viz)
         
         # 3. Телеметрия
         current_telemetry = None
@@ -229,7 +229,7 @@ if __name__ == "__main__":
         start_frame=START_FRAME, 
         end_frame=END_FRAME,
         save_bev_video=False,
-        debug_mode=True,           # 🔥 Включить отладку
-        show_debug_windows=True,   # 🔥 Показывать окна
-        debug_skip_frames=1,       # 🔥 Каждый 3-й кадр
+        debug_mode=True,
+        show_debug_windows=True,
+        debug_skip_frames=1,
     )

@@ -60,15 +60,14 @@ class VisualOdometryIPM:
         mask = np.ones((h, w), dtype=np.uint8)
         
         # На основе вашего изображения - машина внизу по центру
-        cx, cy = w // 2, int(h * 0.92)
-        car_radius = int(min(w, h) * 0.06)
+        cx, cy = w // 2, int(h * 0.90)
+        car_radius = int(min(w, h) * 0.08)
         
         # Круглая маска для машины
         cv2.circle(mask, (cx, cy), car_radius, 0, -1)
         
         # Дополнительно убираем нижнюю часть кадра (там часто артефакты IPM)
         mask[int(h * 0.85):, :] = 0
-        
         return mask
 
     def _estimate_motion(self, kp1, desc1, kp2, desc2):
