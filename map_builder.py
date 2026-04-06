@@ -7,19 +7,22 @@ class LocalMapBuilder:
                  initial_size=4000,
                  blend_decay=0.05,
                  min_weight=0.1,
-                 use_distance_weighting=True):
+                 use_distance_weighting=True,
+                 scale_factor=1.0):
         """
         pixels_per_meter: масштаб карты (пикселей на метр)
         initial_size: начальный размер холста карты
         blend_decay: коэффициент затухания старых кадров (0.0-1.0)
         min_weight: минимальный вес для обновления пикселя
         use_distance_weighting: использовать взвешивание по расстоянию от машины
+        scale_factor: масштаб для сжатия карты без потери точности одометрии
         """
         self.ppm = pixels_per_meter
         self.initial_size = initial_size
         self.blend_decay = blend_decay
         self.min_weight = min_weight
         self.use_distance_weighting = use_distance_weighting
+        self.scale_factor = scale_factor
         
         # Инициализация карты
         self.map = np.zeros((initial_size, initial_size, 3), dtype=np.uint8)
@@ -76,10 +79,11 @@ class LocalMapBuilder:
         """Расширяет карту, если новые данные выходят за границы"""
         margin = 500
         
-        new_min_x = min(self.map_bounds['min_x'], new_bounds['min_x']) - margin
-        new_max_x = max(self.map_bounds['max_x'], new_bounds['max_x']) + margin
-        new_min_y = min(self.map_bounds['min_y'], new_bounds['min_y']) - margin
-        new_max_y = max(self.map_bounds['max_y'], new_bounds['max_y']) + margin
+        # Boundaries of the ALLOCATED map memory relative to coordinate 0
+        new_min_x = min(0, new_bounds['min_x']) - margin if new_bounds['min_x'] < 0 else 0
+        new_max_x = max(self.map.shape[1], new_bounds['max_x']) + margin if new_bounds['max_x'] > self.map.shape[1] else self.map.shape[1]
+        new_min_y = min(0, new_bounds['min_y']) - margin if new_bounds['min_y'] < 0 else 0
+        new_max_y = max(self.map.shape[0], new_bounds['max_y']) + margin if new_bounds['max_y'] > self.map.shape[0] else self.map.shape[0]
         
         current_h, current_w = self.map.shape[:2]
         new_h = new_max_y - new_min_y
@@ -91,29 +95,24 @@ class LocalMapBuilder:
             new_map = np.zeros((new_h, new_w, 3), dtype=np.uint8)
             new_weight_map = np.zeros((new_h, new_w), dtype=np.float32)
             
-            # Смещение для копирования старых данных
-            offset_x = self.center_x - new_min_x
-            offset_y = self.center_y - new_min_y
+            # Смещение для копирования старых данных (0 в старой карте = offset_x в новой)
+            offset_x = 0 - new_min_x
+            offset_y = 0 - new_min_y
             
             new_map[offset_y:offset_y+current_h, offset_x:offset_x+current_w] = self.map
             new_weight_map[offset_y:offset_y+current_h, offset_x:offset_x+current_w] = self.weight_map
             
             self.map = new_map
             self.weight_map = new_weight_map
-            self.center_x = offset_x
-            self.center_y = offset_y
             
-            self.map_bounds = {
-                'min_x': new_min_x,
-                'max_x': new_max_x,
-                'min_y': new_min_y,
-                'max_y': new_max_y
-            }
+            # Смещаем глобальный центр (позу)
+            self.center_x += offset_x
+            self.center_y += offset_y
 
     def _pose_to_map_coords(self, pose):
         """Конвертирует позу из пикселей BEV в координаты карты"""
-        map_x = self.center_x + pose[0]
-        map_y = self.center_y + pose[1]
+        map_x = self.center_x + pose[0] * self.scale_factor
+        map_y = self.center_y + pose[1] * self.scale_factor
         theta = pose[2]
         return map_x, map_y, theta
 
@@ -123,11 +122,16 @@ class LocalMapBuilder:
         """
         self.poses.append(pose.copy())
         
+        # Сжимаем изображение для глобальной карты
+        if self.scale_factor != 1.0:
+            bev_image = cv2.resize(bev_image, (0, 0), fx=self.scale_factor, fy=self.scale_factor, interpolation=cv2.INTER_AREA)
+            
         h, w = bev_image.shape[:2]
         map_x, map_y, theta = self._pose_to_map_coords(pose)
         
-        # 1. Поворачиваем BEV согласно ориентации машины
-        rotation_matrix = cv2.getRotationMatrix2D((w//2, h//2), np.degrees(theta), 1.0)
+        # 1. Поворачиваем BEV согласно ориентации машины вокруг задней оси!
+        car_cy = int(h * 0.85)
+        rotation_matrix = cv2.getRotationMatrix2D((w//2, car_cy), np.degrees(theta), 1.0)
         bev_rotated = cv2.warpAffine(bev_image, rotation_matrix, (w, h), 
                                      borderMode=cv2.BORDER_REFLECT)
         
@@ -139,9 +143,13 @@ class LocalMapBuilder:
         else:
             distance_weights = np.ones((h, w), dtype=np.float32)
         
-        # 3. Маска валидных пикселей (убираем черные края IPM)
+        # 3. Маска валидных пикселей (убираем черные края IPM и саму машину)
         validity_mask = (bev_rotated[:,:,0] > 10) | (bev_rotated[:,:,1] > 10) | (bev_rotated[:,:,2] > 10)
         validity_mask = validity_mask.astype(np.float32)
+        
+        # Полностью вырезаем машину (учитывая масштаб!)
+        mask_radius = int(120 * self.scale_factor)
+        cv2.circle(validity_mask, (w // 2, int(h * 0.85)), mask_radius, 0, -1)
         
         # 4. Комбинируем веса
         frame_weights = distance_weights * validity_mask
@@ -188,10 +196,8 @@ class LocalMapBuilder:
         map_region = self.map[dst_y_start:dst_y_end, dst_x_start:dst_x_end]
         weight_map_region = self.weight_map[dst_y_start:dst_y_end, dst_x_start:dst_x_end]
         
-        # 10. Затухание старых весов
-        self.weight_map *= (1.0 - self.blend_decay)
-        # Обновляем region после затухания глобальной карты
-        weight_map_region = self.weight_map[dst_y_start:dst_y_end, dst_x_start:dst_x_end]
+        # 10. Затухание старых весов (ТОЛЬКО В ЗОНЕ ПЕРЕКРЫТИЯ!)
+        weight_map_region *= (1.0 - self.blend_decay)
         
         # 11. Смешивание с весами
         new_weights = weight_map_region + weight_region
