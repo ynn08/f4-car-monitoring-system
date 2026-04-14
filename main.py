@@ -1,6 +1,7 @@
 import os
 import cv2
 import numpy as np
+import json
 from tqdm import tqdm
 
 from ipm import IPM_4Points
@@ -140,7 +141,14 @@ def build_map_from_video_4points(video_path,
         # 4. Визуальная одометрия
         pose, debug_data = vo.update(bev, telemetry=current_telemetry)
         
-        # 5. Отладочная визуализация
+        # 5. Уточнение по карте
+        refined_pose, ref_val = builder.refine_pose_against_map(bev, pose, search_range=15)
+        if ref_val > 0.8:
+            # Плавное уточнение для исключения резких прыжков
+            alpha = 0.15
+            pose = (1.0 - alpha) * pose + alpha * refined_pose
+            
+        # 6. Отладочная визуализация
         if debug_mode and show_debug_windows and debug_data is not None:
             debug_frame_count += 1
             if debug_frame_count % debug_skip_frames == 0:
@@ -165,8 +173,8 @@ def build_map_from_video_4points(video_path,
                     # Пробел - пауза
                     cv2.waitKey(0)
         
-        # 6. Добавляем на карту
-        builder.add_frame(bev, pose)
+        # 7. Добавляем на карту
+        builder.add_frame(bev, pose, frame_idx=frame_count)
         
         if save_bev_video:
             bevs.append(bev)
@@ -187,6 +195,7 @@ def build_map_from_video_4points(video_path,
     print(f"  Successful matches: {stats['successful_matches']}")
     print(f"  Success rate: {stats['successful_matches']/max(1, stats['total_frames'])*100:.1f}%")
     print(f"  Avg matches per frame: {stats['avg_matches']:.1f}")
+    print(f"  Map-to-Frame Refinements: {builder.refinement_count}")
     print(f"{'='*60}\n")
 
     if save_bev_video:
@@ -199,17 +208,10 @@ def build_map_from_video_4points(video_path,
             ipm_video.write(bev)
         ipm_video.release()
 
-    builder.save_map(output_map_path)
-    print(f"✓ Map saved to: {output_map_path}")
+    builder.save_map(output_map_path, draw_trajectory=True)
+    print(f"✓ Map saved with trajectory to: {output_map_path}")
 
-    final_map = builder.get_map()
-    
-    if len(builder.poses) > 1:
-        poses = np.array(builder.poses)
-        for i in range(1, len(poses)):
-            pt1 = (int(poses[i-1][0]), int(poses[i-1][1]))
-            pt2 = (int(poses[i][0]), int(poses[i][1]))
-            cv2.line(final_map, pt1, pt2, (255, 0, 0), 2)
+    final_map = builder.get_map(draw_trajectory=True)
 
     cv2.imshow("Local Map", final_map)
     cv2.waitKey(0)
@@ -219,6 +221,22 @@ def build_map_from_video_4points(video_path,
     print(f"  Frames processed: {frame_count - start_frame}")
     print(f"  Map size: {final_map.shape[1]}x{final_map.shape[0]} pixels")
     print(f"  Trajectory points: {len(builder.poses)}")
+    
+    # Сохраняем траекторию
+    trajectory_file = "trajectory.json"
+    trajectory_data = []
+    for i in range(len(builder.poses)):
+        p = builder.poses[i]
+        trajectory_data.append({
+            'frame': int(builder.frame_indices[i]),
+            'x': float(p[0]),
+            'y': float(p[1]),
+            'theta': float(p[2])
+        })
+    
+    with open(trajectory_file, 'w') as f:
+        json.dump(trajectory_data, f, indent=4)
+    print(f"✓ Trajectory saved to: {trajectory_file}")
 
 
 if __name__ == "__main__":

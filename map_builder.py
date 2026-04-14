@@ -32,8 +32,10 @@ class LocalMapBuilder:
         self.center_x = initial_size // 2
         self.center_y = initial_size // 2
         
-        # История поз
+        # История поз (x, y, theta)
         self.poses = []
+        self.frame_indices = []
+        self.refinement_count = 0
         self.current_pose = np.array([0.0, 0.0, 0.0])
         
         # Границы карты для расширения
@@ -116,11 +118,103 @@ class LocalMapBuilder:
         theta = pose[2]
         return map_x, map_y, theta
 
-    def add_frame(self, bev_image, pose):
+    def refine_pose_against_map(self, bev_image, predicted_pose, frame_idx=None, search_range=10, angle_steps=0):
+        """
+        Уточняет позу, сопоставляя текущий BEV-кадр с уже построенной картой.
+        bev_image: исходный кадр (полного размера)
+        predicted_pose: [x, y, theta] от VO
+        search_range: радиус поиска в пикселях карты
+        """
+        if len(self.poses) < 10: # Не уточняем первые кадры
+            return predicted_pose, 0.0
+            
+        # 1. Подготавливаем текущий кадр (масштабируем и поворачиваем)
+        if self.scale_factor != 1.0:
+            bev_small = cv2.resize(bev_image, (0, 0), fx=self.scale_factor, fy=self.scale_factor, interpolation=cv2.INTER_AREA)
+        else:
+            bev_small = bev_image.copy()
+            
+        h_s, w_s = bev_small.shape[:2]
+        map_x, map_y, theta = self._pose_to_map_coords(predicted_pose)
+        
+        # Поворачиваем малый кадр
+        car_cy_s = int(h_s * 0.85)
+        rot_mat = cv2.getRotationMatrix2D((w_s//2, car_cy_s), np.degrees(theta), 1.0)
+        bev_rot = cv2.warpAffine(bev_small, rot_mat, (w_s, h_s), borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+        
+        # Оставляем только центральную часть для матчинга (чтобы не ловить края)
+        roi_size = int(min(h_s, w_s) * 0.6)
+        y1_r, y2_r = car_cy_s - roi_size//2, car_cy_s + roi_size//2
+        x1_r, x2_r = w_s//2 - roi_size//2, w_s//2 + roi_size//2
+        
+        # Проверка границ ROI
+        y1_r, y2_r = max(0, y1_r), min(h_s, y2_r)
+        x1_r, x2_r = max(0, x1_r), min(w_s, x2_r)
+        
+        template = cv2.cvtColor(bev_rot[y1_r:y2_r, x1_r:x2_r], cv2.COLOR_BGR2GRAY)
+        
+        # 2. Вырезаем кусок карты для поиска
+        # Позиция машины в BEV относительно оффсета в add_frame:
+        # offset_x = int(map_x - w // 2)
+        # offset_y = int(map_y - int(h * 0.85))
+        
+        # Нам нужен кусок карты вокруг map_x, map_y
+        pad = search_range + roi_size // 2 + 5
+        search_y1 = int(map_y - pad)
+        search_y2 = int(map_y + pad)
+        search_x1 = int(map_x - pad)
+        search_x2 = int(map_x + pad)
+        
+        if search_y1 < 0 or search_x1 < 0 or search_y2 >= self.map.shape[0] or search_x2 >= self.map.shape[1]:
+            return predicted_pose, 0.0
+            
+        map_patch = cv2.cvtColor(self.map[search_y1:search_y2, search_x1:search_x2], cv2.COLOR_BGR2GRAY)
+        
+        # 3. Матчинг
+        # Проверяем, есть ли на карте текстура (не черная ли она)
+        if np.mean(map_patch) < 5:
+            return predicted_pose, 0.0
+            
+        res = cv2.matchTemplate(map_patch, template, cv2.TM_CCOEFF_NORMED)
+        min_val, max_val, min_loc, max_loc = cv2.minMaxLoc(res)
+        
+        if max_val > 0.8: # Повышаем порог уверенности еще сильнее
+            mx, my = max_loc[0], max_loc[1]
+            
+            # Subpixel refinement (parabola fitting)
+            sub_x, sub_y = 0.0, 0.0
+            if 0 < mx < res.shape[1] - 1 and 0 < my < res.shape[0] - 1:
+                left, center, right = res[my, mx-1], res[my, mx], res[my, mx+1]
+                denom_x = 2.0 * (left - 2.0 * center + right)
+                if denom_x != 0: sub_x = (left - right) / denom_x
+                    
+                up, down = res[my-1, mx], res[my+1, mx]
+                denom_y = 2.0 * (up - 2.0 * center + down)
+                if denom_y != 0: sub_y = (up - down) / denom_y
+
+            # Смещение центра шаблона относительно начала патча
+            dx_map = (mx + sub_x) - (pad - roi_size//2)
+            dy_map = (my + sub_y) - (pad - roi_size//2)
+            
+            # Корректируем позу (переводим пиксели карты обратно в координаты VO)
+            refined_pose = predicted_pose.copy()
+            refined_pose[0] += dx_map / self.scale_factor
+            refined_pose[1] += dy_map / self.scale_factor
+            
+            self.refinement_count += 1
+            return refined_pose, max_val
+            
+        return predicted_pose, max_val
+
+    def add_frame(self, bev_image, pose, frame_idx=None):
         """
         Добавляет кадр на карту с учетом веса и позиции
         """
         self.poses.append(pose.copy())
+        if frame_idx is not None:
+            self.frame_indices.append(frame_idx)
+        else:
+            self.frame_indices.append(len(self.poses))
         
         # Сжимаем изображение для глобальной карты
         if self.scale_factor != 1.0:
@@ -218,8 +312,18 @@ class LocalMapBuilder:
         
         self.current_pose = pose
 
-    def get_map(self, crop_to_content=True):
+    def get_map(self, crop_to_content=True, draw_trajectory=False):
         """Возвращает итоговую карту"""
+        res_map = self.map.copy()
+        
+        if draw_trajectory:
+            trajectory = self.get_trajectory()
+            if len(trajectory) > 1:
+                for i in range(1, len(trajectory)):
+                    pt1 = (int(trajectory[i-1][0]), int(trajectory[i-1][1]))
+                    pt2 = (int(trajectory[i][0]), int(trajectory[i][1]))
+                    cv2.line(res_map, pt1, pt2, (255, 0, 0), 2)
+
         if crop_to_content:
             valid_mask = self.weight_map > self.min_weight
             if np.any(valid_mask):
@@ -230,16 +334,16 @@ class LocalMapBuilder:
                 margin = 50
                 y_min = max(0, y_min - margin)
                 x_min = max(0, x_min - margin)
-                y_max = min(self.map.shape[0], y_max + margin)
-                x_max = min(self.map.shape[1], x_max + margin)
+                y_max = min(res_map.shape[0], y_max + margin)
+                x_max = min(res_map.shape[1], x_max + margin)
                 
-                return self.map[y_min:y_max, x_min:x_max].copy()
+                return res_map[y_min:y_max, x_min:x_max].copy()
         
-        return self.map.copy()
+        return res_map
 
-    def save_map(self, path):
+    def save_map(self, path, draw_trajectory=True):
         """Сохраняет карту в файл"""
-        map_to_save = self.get_map(crop_to_content=True)
+        map_to_save = self.get_map(crop_to_content=True, draw_trajectory=draw_trajectory)
         cv2.imwrite(path, map_to_save)
         print(f"💾 Map saved: {path} ({map_to_save.shape[1]}x{map_to_save.shape[0]})")
 
