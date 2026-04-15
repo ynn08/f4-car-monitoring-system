@@ -33,58 +33,52 @@ class VisualOdometryIPM:
         
         # Настройки шаблона (ближний)
         self.t1_y1, self.t1_y2 = 150, 270 
-        self.t1_x1, self.t1_x2 = 120, 480
+        self.t1_regions = [(100, 350), (250, 500)] # Большая левая зона, Большая правая зона
         self.cY1 = (self.t1_y1 + self.t1_y2) / 2.0
         
         # Настройки шаблона (дальний)
         self.t2_y1, self.t2_y2 = 10, 110  
-        self.t2_x1, self.t2_x2 = 120, 480
+        self.t2_regions = [(100, 350), (250, 500)]
         self.cY2 = (self.t2_y1 + self.t2_y2) / 2.0
 
         self.confidence_threshold = 0.5
 
-    def _match_template(self, current_gray, template, t_x1, t_y1, pred_dx, pred_dy, w, h, t_angle=0):
-        # Поворачиваем шаблон, если есть предсказанное вращение
-        if t_angle != 0:
-            h_t, w_t = template.shape[:2]
-            rot_m = cv2.getRotationMatrix2D((w_t//2, h_t//2), np.degrees(t_angle), 1.0)
-            template = cv2.warpAffine(template, rot_m, (w_t, h_t), borderMode=cv2.BORDER_REFLECT_101)
-
-        search_x1 = max(0, int(t_x1 + pred_dx - 120))
-        search_x2 = min(w, int(t_x1 + template.shape[1] + pred_dx + 120))
-        
-        if self.stats['successful_matches'] < 5:
-            search_y1 = max(0, int(t_y1 - 40))
-            search_y2 = min(h, int(t_y1 + template.shape[0] + 160))
-        else:
-            search_y1 = max(0, int(t_y1 + pred_dy - 100))
-            search_y2 = min(h, int(t_y1 + template.shape[0] + pred_dy + 120))
-
-        if search_x2 - search_x1 >= template.shape[1] and search_y2 - search_y1 >= template.shape[0]:
-            search_roi = current_gray[search_y1:search_y2, search_x1:search_x2]
-            res = cv2.matchTemplate(search_roi, template, cv2.TM_CCOEFF_NORMED)
-            _, max_val, _, max_loc = cv2.minMaxLoc(res)
+    def find_best_match(self, current_gray, regions, y1, y2):
+        best_val = -1
+        best_shift = None
+        best_x1 = 0
+        best_x2 = 0
+        best_kp = None
+        for (x1, x2) in regions:
+            template = self.prev_gray[y1:y2, x1:x2]
+            # Ищем в окрестности этого региона на новом кадре
+            search_x1 = max(0, x1 - 50)
+            search_x2 = min(current_gray.shape[1], x2 + 50)
+            search_y1 = max(0, y1 - 30)
+            search_y2 = min(current_gray.shape[0], y2 + 50 + 20) # ожидаем сдвиг вниз (машина едет вперед)
+            if search_y2 <= search_y1 or search_x2 <= search_x1: continue
             
-            if max_val >= self.confidence_threshold:
-                mx, my = max_loc[0], max_loc[1]
-                sub_x, sub_y = 0.0, 0.0
-                if 0 < mx < res.shape[1] - 1 and 0 < my < res.shape[0] - 1:
-                    l, c, r = res[my, mx-1], res[my, mx], res[my, mx+1]
-                    denom_x = 2.0 * (l - 2.0 * c + r)
-                    if denom_x != 0: sub_x = (l - r) / denom_x
-                    u, c, d = res[my-1, mx], res[my, mx], res[my+1, mx]
-                    denom_y = 2.0 * (u - 2.0 * c + d)
-                    if denom_y != 0: sub_y = (u - d) / denom_y
-
-                match_x = mx + sub_x + search_x1
-                match_y = my + sub_y + search_y1
-                dx = match_x - t_x1
-                dy = match_y - t_y1
+            search_area = current_gray[search_y1:search_y2, search_x1:search_x2]
+            if search_area.shape[0] < template.shape[0] or search_area.shape[1] < template.shape[1]:
+                continue
                 
-                if pred_dy > 30 and dy < 20:
-                    return False, 0.0, 0.0, max_val
-                return True, dx, dy, max_val
-        return False, 0.0, 0.0, 0.0
+            res = cv2.matchTemplate(search_area, template, cv2.TM_CCOEFF_NORMED)
+            min_val, max_val, min_loc, max_loc = cv2.minMaxLoc(res)
+            
+            if max_val > best_val:
+                best_val = max_val
+                # Считаем сдвиг
+                match_x = search_x1 + max_loc[0]
+                match_y = search_y1 + max_loc[1]
+                dx = match_x - x1
+                dy = match_y - y1
+                best_shift = (dx, dy)
+                best_x1, best_x2 = x1, x2
+                best_kp = current_gray[y1:y2, x1:x2]
+                
+        if best_val >= self.confidence_threshold:
+            return True, best_shift[0], best_shift[1], best_x1, best_x2, best_kp
+        return False, 0, 0, 0, 0, None
 
     def update(self, bev_image, telemetry=None):
         self.frame_count += 1
@@ -98,9 +92,11 @@ class VisualOdometryIPM:
             self.prev_gray = current_gray
             return np.array([self.x, self.y, self.theta]), None
 
-        template1 = self.prev_gray[self.t1_y1:self.t1_y2, self.t1_x1:self.t1_x2]
-        template2 = self.prev_gray[self.t2_y1:self.t2_y2, self.t2_x1:self.t2_x2]
-        h_img, w_img = current_gray.shape
+        succ1, dx1, dy1, b1_x1, b1_x2, kp1_img = self.find_best_match(current_gray, self.t1_regions, self.t1_y1, self.t1_y2)
+        succ2, dx2, dy2, b2_x1, b2_x2, kp2_img = self.find_best_match(current_gray, self.t2_regions, self.t2_y1, self.t2_y2)
+
+        if succ1: self.stats['successful_matches'] += 1
+        if succ2: self.stats['successful_matches'] += 1
 
         if telemetry and self.use_telemetry:
             ppm = getattr(self, 'ppm', 80.0) 
@@ -111,46 +107,49 @@ class VisualOdometryIPM:
         else:
             pred_dx, pred_dy, pred_dtheta = self.last_pure_dx, self.last_pure_dy, self.last_dtheta
 
-        Y_ROT = 340
-        t1_pred_dx = pred_dx + (self.cY1 - Y_ROT) * pred_dtheta
-        t2_pred_dx = pred_dx + (self.cY2 - Y_ROT) * pred_dtheta
-
-        succ1, dx1, dy1, val1 = self._match_template(current_gray, template1, self.t1_x1, self.t1_y1, t1_pred_dx, pred_dy, w_img, h_img, t_angle=pred_dtheta)
-        succ2, dx2, dy2, val2 = self._match_template(current_gray, template2, self.t2_x1, self.t2_y1, t2_pred_dx, pred_dy, w_img, h_img, t_angle=pred_dtheta)
+        raw_pure_dx, raw_pure_dy, raw_dtheta = 0.0, pred_dy, pred_dtheta
 
         if succ1 and succ2:
+            # Вычисляем вращение из разности поперечных сдвигов (не зависит от горизонтальной позиции если шаблон жесткий)
             raw_dtheta = (dx1 - dx2) / (self.cY1 - self.cY2)
-            raw_pure_dx = dx1 - (self.cY1 - 340) * raw_dtheta
-            raw_pure_dy = (dy1 + dy2) / 2.0
+            
+            # Математически компенсируем тангенциальное движение, вызванное физическим отдалением шаблона от центра вращения машины (x=300)
+            c1_x = (b1_x1 + b1_x2) / 2.0
+            c2_x = (b2_x1 + b2_x2) / 2.0
+            
+            true_dy1 = dy1 - (c1_x - 300) * raw_dtheta
+            true_dy2 = dy2 - (c2_x - 300) * raw_dtheta
+            raw_pure_dy = (true_dy1 + true_dy2) / 2.0
             
             if self.frame_count > 5:
                 if abs(raw_dtheta - self.last_dtheta) > 0.05: raw_dtheta = self.last_dtheta
                 if abs(raw_pure_dy - self.last_pure_dy) > 30: raw_pure_dy = self.last_pure_dy
-                if abs(raw_pure_dx - self.last_pure_dx) > 15: raw_pure_dx = self.last_pure_dx
 
             alpha_pos, alpha_ang = (0.8, 0.3) if self.frame_count > 5 else (1.0, 1.0)
-            pure_dx = alpha_pos * raw_pure_dx + (1.0 - alpha_pos) * self.last_pure_dx
+            pure_dx = self.last_pure_dx # поперечное смещение чисто от одометрии отключено для стабильности
             pure_dy = alpha_pos * raw_pure_dy + (1.0 - alpha_pos) * self.last_pure_dy
             dtheta = alpha_ang * raw_dtheta + (1.0 - alpha_ang) * self.last_dtheta
-            self.stats['successful_matches'] += 1
             
         elif succ1:
-            raw_pure_dy, raw_dtheta = dy1, pred_dtheta * 0.95
-            raw_pure_dx = dx1 - (self.cY1 - 340) * raw_dtheta
+            c1_x = (b1_x1 + b1_x2) / 2.0
+            raw_dtheta = pred_dtheta * 0.95
+            raw_pure_dy = dy1 - (c1_x - 300) * raw_dtheta
+            
             alpha_pos, alpha_ang = (0.4, 0.2) if self.frame_count > 5 else (1.0, 1.0)
-            pure_dx = alpha_pos * raw_pure_dx + (1.0 - alpha_pos) * self.last_pure_dx
+            pure_dx = self.last_pure_dx
             pure_dy = alpha_pos * raw_pure_dy + (1.0 - alpha_pos) * self.last_pure_dy
             dtheta = alpha_ang * raw_dtheta + (1.0 - alpha_ang) * self.last_dtheta
-            self.stats['successful_matches'] += 1
             
         elif succ2:
-            raw_pure_dy, raw_dtheta = dy2, pred_dtheta * 0.95
-            raw_pure_dx = dx2 - (self.cY2 - 340) * raw_dtheta
+            c2_x = (b2_x1 + b2_x2) / 2.0
+            raw_dtheta = pred_dtheta * 0.95
+            raw_pure_dy = dy2 - (c2_x - 300) * raw_dtheta
+            
             alpha_pos, alpha_ang = (0.4, 0.2) if self.frame_count > 5 else (1.0, 1.0)
-            pure_dx = alpha_pos * raw_pure_dx + (1.0 - alpha_pos) * self.last_pure_dx
+            pure_dx = self.last_pure_dx
             pure_dy = alpha_pos * raw_pure_dy + (1.0 - alpha_pos) * self.last_pure_dy
             dtheta = alpha_ang * raw_dtheta + (1.0 - alpha_ang) * self.last_dtheta
-            self.stats['successful_matches'] += 1
+            
         else:
             pure_dx, pure_dy, dtheta = pred_dx * 0.9, pred_dy, pred_dtheta * 0.9 
 
@@ -172,15 +171,18 @@ class VisualOdometryIPM:
         debug_data = None
         if self.debug_mode:
             disp = cv2.cvtColor(current_gray, cv2.COLOR_GRAY2BGR)
-            cv2.rectangle(disp, (self.t1_x1, self.t1_y1), (self.t1_x2, self.t1_y2), (0, 255, 0), 2)
-            cv2.rectangle(disp, (self.t2_x1, self.t2_y1), (self.t2_x2, self.t2_y2), (0, 0, 255), 2)
+            for (rx1, rx2) in self.t1_regions: cv2.rectangle(disp, (rx1, self.t1_y1), (rx2, self.t1_y2), (0, 100, 0), 1)
+            for (rx1, rx2) in self.t2_regions: cv2.rectangle(disp, (rx1, self.t2_y1), (rx2, self.t2_y2), (0, 0, 100), 1)
+                
             if succ1:
-                match_x = self.t1_x1 + int(dx1)
+                cv2.rectangle(disp, (b1_x1, self.t1_y1), (b1_x2, self.t1_y2), (0, 255, 0), 2)
+                match_x = b1_x1 + int(dx1)
                 match_y = self.t1_y1 + int(dy1)
-                cv2.circle(disp, (match_x + (self.t1_x2-self.t1_x1)//2, match_y + (self.t1_y2-self.t1_y1)//2), 5, (0, 255, 255), -1)
+                cv2.circle(disp, (match_x + (b1_x2-b1_x1)//2, match_y + (self.t1_y2-self.t1_y1)//2), 5, (0, 255, 255), -1)
             
-            kp1_img = current_gray[self.t1_y1:self.t1_y2, self.t1_x1:self.t1_x2]
-            kp2_img = current_gray[self.t2_y1:self.t2_y2, self.t2_x1:self.t2_x2]
+            if not succ1: kp1_img = np.zeros((self.t1_y2 - self.t1_y1, 100), dtype=np.uint8)
+            if not succ2: kp2_img = np.zeros((self.t2_y2 - self.t2_y1, 100), dtype=np.uint8)
+            
             debug_data = (disp, kp1_img, kp2_img)
 
         return np.array([self.x, self.y, self.theta]), debug_data
