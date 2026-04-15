@@ -81,9 +81,9 @@ def build_map_from_video_4points(video_path,
     builder = LocalMapBuilder(
         pixels_per_meter=int(ppm / 1.47),      # Синхронизировано с PPM
         initial_size=5000,        # Начальный холст
-        blend_decay=0.05,
+        blend_decay=0.02,         # Уменьшаем затухание для более плотной карты
         use_distance_weighting=True,
-        scale_factor=0.05         # 🔥 Уменьшаем карту в 4 раза (в 16 раз меньше памяти) для полного круга
+        scale_factor=0.10         # Увеличиваем разрешение карты в 2 раза
     )
     
     use_telemetry = telemetry_path is not None
@@ -142,11 +142,13 @@ def build_map_from_video_4points(video_path,
         pose, debug_data = vo.update(bev, telemetry=current_telemetry)
         
         # 5. Уточнение по карте
-        refined_pose, ref_val = builder.refine_pose_against_map(bev, pose, search_range=15)
-        if ref_val > 0.8:
-            # Плавное уточнение для исключения резких прыжков
-            alpha = 0.15
-            pose = (1.0 - alpha) * pose + alpha * refined_pose
+        refined_pose, ref_val = builder.refine_pose_against_map(bev, pose, search_range=10)
+        if ref_val > 0.85: # Еще немного повысим порог
+            # Проверка на физическую правдоподобность (не прыгаем больше чем на 1 метр за кадр)
+            dist = np.linalg.norm(refined_pose[:2] - pose[:2])
+            if dist < 80: # ~0.8-0.9 метра при ppm=92
+                alpha = 0.15
+                pose = (1.0 - alpha) * pose + alpha * refined_pose
             
         # 6. Отладочная визуализация
         if debug_mode and show_debug_windows and debug_data is not None:
@@ -244,9 +246,9 @@ if __name__ == "__main__":
     TELEMETRY_PATH = None
     
     # START_FRAME = 1038
-    START_FRAME = 0
+    START_FRAME = 1200
 
-    END_FRAME = START_FRAME + 3200
+    END_FRAME = START_FRAME + 2000
     
     build_map_from_video_4points(
         VIDEO_PATH, 

@@ -175,36 +175,74 @@ class LocalMapBuilder:
         if np.mean(map_patch) < 5:
             return predicted_pose, 0.0
             
-        res = cv2.matchTemplate(map_patch, template, cv2.TM_CCOEFF_NORMED)
-        min_val, max_val, min_loc, max_loc = cv2.minMaxLoc(res)
+        # 3. Матчинг с перебором углов (-2, 0, 2 градуса)
+        best_val = 0.0
+        best_loc = (0, 0)
+        best_sub = (0, 0)
+        best_d_theta = 0.0
         
-        if max_val > 0.8: # Повышаем порог уверенности еще сильнее
-            mx, my = max_loc[0], max_loc[1]
+        for d_theta in [-2.0, 0.0, 2.0]:
+            if d_theta != 0.0:
+                rot_mat_fine = cv2.getRotationMatrix2D((w_s//2, car_cy_s), np.degrees(theta) + d_theta, 1.0)
+                bev_rot_fine = cv2.warpAffine(bev_small, rot_mat_fine, (w_s, h_s), borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+                template_fine = cv2.cvtColor(bev_rot_fine[y1_r:y2_r, x1_r:x2_r], cv2.COLOR_BGR2GRAY)
+            else:
+                template_fine = template
+
+            res = cv2.matchTemplate(map_patch, template_fine, cv2.TM_CCOEFF_NORMED)
+            _, current_max, _, current_loc = cv2.minMaxLoc(res)
             
-            # Subpixel refinement (parabola fitting)
-            sub_x, sub_y = 0.0, 0.0
-            if 0 < mx < res.shape[1] - 1 and 0 < my < res.shape[0] - 1:
-                left, center, right = res[my, mx-1], res[my, mx], res[my, mx+1]
-                denom_x = 2.0 * (left - 2.0 * center + right)
-                if denom_x != 0: sub_x = (left - right) / denom_x
-                    
-                up, down = res[my-1, mx], res[my+1, mx]
-                denom_y = 2.0 * (up - 2.0 * center + down)
-                if denom_y != 0: sub_y = (up - down) / denom_y
+            if current_max > best_val:
+                best_val = current_max
+                best_loc = current_loc
+                best_d_theta = d_theta
+                
+                # Subpixel refinement
+                mx, my = current_loc[0], current_loc[1]
+                sub_x, sub_y = 0.0, 0.0
+                if 0 < mx < res.shape[1] - 1 and 0 < my < res.shape[0] - 1:
+                    left, center, right = res[my, mx-1], res[my, mx], res[my, mx+1]
+                    denom_x = 2.0 * (left - 2.0 * center + right)
+                    if denom_x != 0: sub_x = (left - right) / denom_x
+                    up, down = res[my-1, mx], res[my+1, mx]
+                    denom_y = 2.0 * (up - 2.0 * center + down)
+                    if denom_y != 0: sub_y = (up - down) / denom_y
+                best_sub = (sub_x, sub_y)
+
+        if best_val > 0.85: # Повышаем порог уверенности
+            # ПРОВЕРКА ПО КАРТЕ ВЕСОВ
+            # Получаем значение веса в точке матчинга
+            try:
+                # Масштабируем dx_map, dy_map обратно в координаты патча
+                match_y_in_patch = int(best_loc[1])
+                match_x_in_patch = int(best_loc[0])
+                
+                # Извлекаем тот же патч из карты весов
+                weight_patch = self.weight_map[int(py_s - pad):int(py_s + pad), int(px_s - pad):int(px_s + pad)]
+                # Но вес надо смотреть у шаблона ( ROI )
+                roi_weight = weight_patch[match_y_in_patch:match_y_in_patch+roi_size, match_x_in_patch:match_x_in_patch+roi_size]
+                avg_weight = np.mean(roi_weight)
+                
+                # Если вес слишком мал (меньше 0.3), значит этот участок карты еще не надежен
+                if avg_weight < 0.3:
+                    return predicted_pose, 0.0
+            except:
+                pass
 
             # Смещение центра шаблона относительно начала патча
-            dx_map = (mx + sub_x) - (pad - roi_size//2)
-            dy_map = (my + sub_y) - (pad - roi_size//2)
+            dx_map = (best_loc[0] + best_sub[0]) - (pad - roi_size//2)
+            dy_map = (best_loc[1] + best_sub[1]) - (pad - roi_size//2)
             
-            # Корректируем позу (переводим пиксели карты обратно в координаты VO)
+            # Корректируем позу
             refined_pose = predicted_pose.copy()
             refined_pose[0] += dx_map / self.scale_factor
             refined_pose[1] += dy_map / self.scale_factor
+            refined_pose[2] += np.radians(best_d_theta)
             
             self.refinement_count += 1
-            return refined_pose, max_val
+            return refined_pose, best_val
             
-        return predicted_pose, max_val
+        return predicted_pose, best_val
 
     def add_frame(self, bev_image, pose, frame_idx=None):
         """
