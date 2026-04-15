@@ -99,7 +99,7 @@ class VisualOdometryIPM:
         if succ2: self.stats['successful_matches'] += 1
 
         if telemetry and self.use_telemetry:
-            ppm = getattr(self, 'ppm', 80.0) 
+            ppm = getattr(self, 'ppm', 62.6)  # 92px_car_width / 1.47m = 62.6 px/m
             dt = telemetry.get('dt', 1/30)
             pred_dy = telemetry.get('speed', 0) * dt * ppm
             pred_dx = 0.0
@@ -152,6 +152,10 @@ class VisualOdometryIPM:
             
         else:
             pure_dx, pure_dy, dtheta = pred_dx * 0.9, pred_dy, pred_dtheta * 0.9 
+
+        if telemetry and self.use_telemetry:
+            # Полностью доверяем скорости из телеметрии (решает проблему сжатия прямых трасс)
+            pure_dy = pred_dy
 
         self.last_pure_dx, self.last_pure_dy = pure_dx, pure_dy
         self.dtheta_history.append(dtheta)

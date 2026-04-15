@@ -9,9 +9,44 @@ from map_builder import LocalMapBuilder
 from visual_odometry_ipm import VisualOdometryIPM
 
 
-def load_telemetry(video_path):
-    """Заглушка для телеметрии"""
-    return None
+import csv
+
+# Синхронизация: телеметрия 0:085 (0.085с) = видео кадр 139 (139/30 = 4.633с)
+# => video_time = telemetry_time + TELEMETRY_VIDEO_OFFSET
+TELEMETRY_VIDEO_OFFSET = 139.0 / 30.0 - 0.085  # ≈ 4.548 секунд
+
+def load_telemetry(telemetry_path):
+    """Загрузка телеметрии из CSV с точной синхронизацией по видео"""
+    if not telemetry_path or not os.path.exists(telemetry_path):
+        return None
+    try:
+        times = []
+        speeds = []
+        with open(telemetry_path, 'r', encoding='utf-8', errors='ignore') as f:
+            reader = csv.DictReader(f, delimiter=';')
+            for row in reader:
+                t_str = row.get('Time', '0:000').strip()
+                parts = t_str.split(':')
+                # Формат M:SSS (минуты:миллисекунды)
+                t_sec = float(parts[0]) * 60.0 + float(parts[1]) / 1000.0 if len(parts) == 2 else 0.0
+                
+                speed_str = row.get('CarSpeed', '0').replace(',', '.')
+                speed_ms = float(speed_str) / 3.6  # km/h -> m/s
+                
+                times.append(t_sec)
+                speeds.append(speed_ms)
+        
+        print(f"📡 Telemetry loaded: {len(times)} records, {times[-1]:.1f}s duration")
+        print(f"   Speed range: {min(speeds)*3.6:.1f} - {max(speeds)*3.6:.1f} km/h")
+        print(f"   Sync offset: {TELEMETRY_VIDEO_OFFSET:.3f}s (tel 0:085 = video frame 139)")
+        
+        return {
+            'time': np.array(times),
+            'speed': np.array(speeds)
+        }
+    except Exception as e:
+        print(f"❌ Error loading telemetry: {e}")
+        return None
 
 
 def build_map_from_video_4points(video_path, 
@@ -83,7 +118,7 @@ def build_map_from_video_4points(video_path,
         initial_size=5000,        # Начальный холст
         blend_decay=0.02,         # Уменьшаем затухание для более плотной карты
         use_distance_weighting=True,
-        scale_factor=0.05         # Увеличиваем разрешение карты в 2 раза
+        scale_factor=0.02        # Увеличиваем разрешение карты в 2 раза
     )
     
     use_telemetry = telemetry_path is not None
@@ -92,7 +127,7 @@ def build_map_from_video_4points(video_path,
         debug_mode=debug_mode
     )
 
-    telemetry_data = load_telemetry(video_path) if telemetry_path else None
+    telemetry_data = load_telemetry(telemetry_path) if telemetry_path else None
 
     bevs = []
     cap = cv2.VideoCapture(video_path)
@@ -135,12 +170,21 @@ def build_map_from_video_4points(video_path,
             weight_viz = cv2.applyColorMap(weight_viz, cv2.COLORMAP_JET)
             cv2.imshow("Distance Weights", weight_viz)
         
-        # 3. Телеметрия
+        # 3. Телеметрия — интерполируем скорость по времени видеокадра
         current_telemetry = None
-        if telemetry_data and frame_count - start_frame < len(telemetry_data):
-            t_idx = frame_count - start_frame
-            current_telemetry = telemetry_data[t_idx]
-            current_telemetry['dt'] = dt
+        if telemetry_data is not None:
+            video_time = frame_count / fps  # абсолютное время видео
+            telemetry_time = video_time - TELEMETRY_VIDEO_OFFSET
+            if telemetry_time >= telemetry_data['time'][0]:
+                speed_interp = float(np.interp(
+                    telemetry_time,
+                    telemetry_data['time'],
+                    telemetry_data['speed']
+                ))
+                current_telemetry = {
+                    'dt': dt,
+                    'speed': speed_interp
+                }
 
         # 4. Визуальная одометрия
         pose, debug_data = vo.update(bev, telemetry=current_telemetry)
@@ -249,7 +293,7 @@ def build_map_from_video_4points(video_path,
 
 if __name__ == "__main__":
     VIDEO_PATH = "data/Q2 354.MP4"
-    TELEMETRY_PATH = None
+    TELEMETRY_PATH = "data/telemetry.csv"
     
     # START_FRAME = 1038
     START_FRAME = 0
@@ -262,7 +306,7 @@ if __name__ == "__main__":
         start_frame=START_FRAME, 
         end_frame=END_FRAME,
         save_bev_video=False,
-        debug_mode=True,           # 🔥 Включить отладку
-        show_debug_windows=True,   # 🔥 Показывать окна
+        debug_mode=True,       # 🔥 Включить отладку
+        show_debug_windows=True,# 🔥 Показывать окна
         debug_skip_frames=1,       # 🔥 Каждый 3-й кадр
     )
