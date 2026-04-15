@@ -83,7 +83,7 @@ def build_map_from_video_4points(video_path,
         initial_size=5000,        # Начальный холст
         blend_decay=0.02,         # Уменьшаем затухание для более плотной карты
         use_distance_weighting=True,
-        scale_factor=0.10         # Увеличиваем разрешение карты в 2 раза
+        scale_factor=0.05         # Увеличиваем разрешение карты в 2 раза
     )
     
     use_telemetry = telemetry_path is not None
@@ -122,9 +122,13 @@ def build_map_from_video_4points(video_path,
         # cv2.imwrite(f"BEV{frame_count}.png", bev)
         bev_gray = cv2.cvtColor(bev, cv2.COLOR_BGR2GRAY) if len(bev.shape) == 3 else bev.copy()
         
-        # 2. Маска машины (для визуализации)
+        # 2. Маска машины (для визуализации и отсечения)
+        # Вырезаем прямоугольником ровно нижнюю-центральную часть, где торчит нос машины
         car_mask = np.ones(bev.shape[:2], dtype=np.uint8) * 255
-        cv2.circle(car_mask, (bev.shape[1] // 2, int(bev.shape[0] * 0.85)), 120, 0, -1)
+        cv2.rectangle(car_mask, 
+                      (bev.shape[1] // 2 - 120, int(bev.shape[0] * 0.75)), 
+                      (bev.shape[1] // 2 + 120, bev.shape[0]), 
+                      0, -1)
         bev_masked = cv2.bitwise_and(bev, bev, mask=car_mask)
         if debug_mode:
             weight_viz = (car_mask).astype(np.uint8)
@@ -164,6 +168,8 @@ def build_map_from_video_4points(video_path,
                 
                 cv2.imshow("BEV + Mask", bev_display)
                 cv2.imshow("Matches", match_img)
+                cv2.imshow("Keypoints Frame 1", kp1_img)
+                cv2.imshow("Keypoints Frame 2", kp2_img)
                 cv2.waitKey(1)
                 
                 # Ждем 1мс, если нажали 'q' - выходим
@@ -246,9 +252,9 @@ if __name__ == "__main__":
     TELEMETRY_PATH = None
     
     # START_FRAME = 1038
-    START_FRAME = 1200
+    START_FRAME = 0
 
-    END_FRAME = START_FRAME + 2000
+    END_FRAME = START_FRAME + 3200
     
     build_map_from_video_4points(
         VIDEO_PATH, 

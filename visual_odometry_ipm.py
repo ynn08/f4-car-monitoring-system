@@ -33,12 +33,12 @@ class VisualOdometryIPM:
         
         # Настройки шаблона (ближний)
         self.t1_y1, self.t1_y2 = 150, 270 
-        self.t1_x1, self.t1_x2 = 150, 450
+        self.t1_x1, self.t1_x2 = 120, 480
         self.cY1 = (self.t1_y1 + self.t1_y2) / 2.0
         
         # Настройки шаблона (дальний)
         self.t2_y1, self.t2_y2 = 10, 110  
-        self.t2_x1, self.t2_x2 = 150, 450
+        self.t2_x1, self.t2_x2 = 120, 480
         self.cY2 = (self.t2_y1 + self.t2_y2) / 2.0
 
         self.confidence_threshold = 0.5
@@ -169,7 +169,21 @@ class VisualOdometryIPM:
         self.theta += filtered_dtheta
         self.prev_gray = current_gray
         
-        return np.array([self.x, self.y, self.theta]), None
+        debug_data = None
+        if self.debug_mode:
+            disp = cv2.cvtColor(current_gray, cv2.COLOR_GRAY2BGR)
+            cv2.rectangle(disp, (self.t1_x1, self.t1_y1), (self.t1_x2, self.t1_y2), (0, 255, 0), 2)
+            cv2.rectangle(disp, (self.t2_x1, self.t2_y1), (self.t2_x2, self.t2_y2), (0, 0, 255), 2)
+            if succ1:
+                match_x = self.t1_x1 + int(dx1)
+                match_y = self.t1_y1 + int(dy1)
+                cv2.circle(disp, (match_x + (self.t1_x2-self.t1_x1)//2, match_y + (self.t1_y2-self.t1_y1)//2), 5, (0, 255, 255), -1)
+            
+            kp1_img = current_gray[self.t1_y1:self.t1_y2, self.t1_x1:self.t1_x2]
+            kp2_img = current_gray[self.t2_y1:self.t2_y2, self.t2_x1:self.t2_x2]
+            debug_data = (disp, kp1_img, kp2_img)
+
+        return np.array([self.x, self.y, self.theta]), debug_data
 
     def get_stats(self):
         self.stats['avg_matches'] = self.stats['successful_matches'] / max(1, self.stats['total_frames'])
