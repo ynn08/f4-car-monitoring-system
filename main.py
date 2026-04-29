@@ -299,9 +299,9 @@ if __name__ == "__main__":
     TELEMETRY_PATH = "data/telemetry.csv"
     
     # START_FRAME = 1038
-    START_FRAME = 0
+    START_FRAME = 2200
 
-    END_FRAME = START_FRAME + 20  # None для обработки всего видео, или укажите конкретный кадр для остановки
+    END_FRAME = 2260  # None для обработки всего видео, или укажите конкретный кадр для остановки
     
     # CONFIG: balanced, sides_short, sides_short_v2, sides_short_v3
     CONFIG = "custom"
