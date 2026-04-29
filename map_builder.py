@@ -8,7 +8,7 @@ class LocalMapBuilder:
                  blend_decay=0.05,
                  min_weight=0.1,
                  use_distance_weighting=True,
-                 scale_factor=1.0):
+                 scale_factor=0.25):
         """
         pixels_per_meter: масштаб карты (пикселей на метр)
         initial_size: начальный размер холста карты

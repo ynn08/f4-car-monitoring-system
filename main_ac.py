@@ -89,46 +89,60 @@ def build_map_from_video_4points(video_path,
     print(f"Mask Config: {config_mode}")
     print(f"{'='*60}\n")
     
-    # Идеально отцентрированная трапеция, которая сохраняет ОРИГИНАЛЬНЫЙ МАСШТАБ (ширина 446px снизу, 260px сверху),
-    # но симметрична относительно Vanishing Point (x=823). Убирает Shear, сохраняет 99% успешных матчей.
+    # Новая трапеция для синтетики (сохраняем старую в комментарии)
+    # OLD:
+    # src_pts = np.float32([
+    #     [823 - 223, 535], # Bottom Left 
+    #     [823 + 223, 535], # Bottom Right
+    #     [823 - 130, 435], # Top Left    
+    #     [823 + 130, 435]  # Top Right   
+    # ])
+    
+    # NEW (Synthetic):
+    # Порядок для IPM_4Points: [BL, BR, TR, TL]
     src_pts = np.float32([
-        [823 - 223, 535], # Bottom Left 
-        [823 + 223, 535], # Bottom Right
-        [823 - 130, 435], # Top Left    
-        [823 + 130, 435]  # Top Right   
+        [487, 627],   # Bottom Left
+        [1003, 630],  # Bottom Right
+        [987, 509],   # Top Right
+        [711, 510]    # Top Left
     ])
-    bev_width = 600
-    bev_height = 400
     
-    car_size = (1.47, 2.80)
-    ppm = 92 # Возвращаем оригинальный масштаб, дающий лучшую точность
-    rect_size = (ppm, ppm * car_size[1] / car_size[0])
+    bev_width = 800   # Увеличим ширину для синтетики, чтобы было больше обзора
+    bev_height = 600  # Увеличим высоту
     
-    # Смещаем дорогу к нижнему краю (0.90) и центрируем по горизонтали
-    rect_left_up_pos = (bev_width // 2 - rect_size[0] // 2, bev_height * 0.90 - rect_size[1])
+    pixels_per_meter = 200 
+    rect_size = (1.47 * pixels_per_meter, 2.80 * pixels_per_meter)
+    
+    # Смещаем дорогу к нижнему краю (0.85) и центрируем по горизонтали
+    rect_left_up_pos = (bev_width // 2 - rect_size[0] // 2, bev_height * 0.85 - rect_size[1])
 
+    # Порядок для IPM_4Points: [BL, BR, TR, TL]
     dst_pts = np.float32([
         [rect_left_up_pos[0], rect_left_up_pos[1] + rect_size[1]],                   
         [rect_left_up_pos[0] + rect_size[0], rect_left_up_pos[1] + rect_size[1]],   
-        [rect_left_up_pos[0], rect_left_up_pos[1]],                                  
         [rect_left_up_pos[0] + rect_size[0], rect_left_up_pos[1]],                   
+        [rect_left_up_pos[0], rect_left_up_pos[1]],                                  
     ])
 
     ipm = IPM_4Points(src_pts, dst_pts, output_size=(bev_width, bev_height))
     builder = LocalMapBuilder(
-        pixels_per_meter=int(ppm / 1.47),      # Синхронизировано с PPM
+        pixels_per_meter=pixels_per_meter,      # Синхронизировано с нашей переменной
         initial_size=5000,        # Начальный холст
         blend_decay=0.02,         # Уменьшаем затухание для более плотной карты
         use_distance_weighting=True,
-        scale_factor=1        # Увеличиваем разрешение карты в 2 раза
+        scale_factor=1.0         # Максимальное разрешение карты
     )
     
     use_telemetry = telemetry_path is not None
     vo = VisualOdometryIPM(
         use_telemetry=use_telemetry,
         debug_mode=debug_mode,
-        config_mode=config_mode
+        config_mode=config_mode,
+        bev_width=bev_width,
+        bev_height=bev_height
     )
+    # Устанавливаем ppm для одометрии (пикселей на метр)
+    vo.ppm = pixels_per_meter
 
     telemetry_data = load_telemetry(telemetry_path) if telemetry_path else None
 
@@ -164,8 +178,8 @@ def build_map_from_video_4points(video_path,
         # Вырезаем прямоугольником ровно нижнюю-центральную часть, где торчит нос машины
         car_mask = np.ones(bev.shape[:2], dtype=np.uint8) * 255
         cv2.rectangle(car_mask, 
-                      (bev.shape[1] // 2 - 120, int(bev.shape[0] * 0.75)), 
-                      (bev.shape[1] // 2 + 120, bev.shape[0]), 
+                      (bev.shape[1] // 2 - 150, int(bev.shape[0] * 0.70)), 
+                      (bev.shape[1] // 2 + 150, bev.shape[0]), 
                       0, -1)
         bev_masked = cv2.bitwise_and(bev, bev, mask=car_mask)
         if debug_mode:
@@ -195,9 +209,9 @@ def build_map_from_video_4points(video_path,
         # 5. Уточнение по карте
         refined_pose, ref_val = builder.refine_pose_against_map(bev, pose, search_range=10)
         if ref_val > 0.85: # Еще немного повысим порог
-            # Проверка на физическую правдоподобность (не прыгаем больше чем на 1 метр за кадр)
+            # Проверка на физическую правдоподобность (не прыгаем больше чем на 1.5 метра за кадр)
             dist = np.linalg.norm(refined_pose[:2] - pose[:2])
-            if dist < 80: # ~0.8-0.9 метра при ppm=92
+            if dist < 300: # ~1.5 метра при ppm=200
                 alpha = 0.15
                 pose = (1.0 - alpha) * pose + alpha * refined_pose
             
@@ -295,16 +309,16 @@ def build_map_from_video_4points(video_path,
 
 
 if __name__ == "__main__":
-    VIDEO_PATH = "data/race_1.mp4"
+    VIDEO_PATH = "data/race_2.mp4"
     TELEMETRY_PATH = "data/telemetry.csv"
     
     # START_FRAME = 1038
     START_FRAME = 0
 
-    END_FRAME = START_FRAME + 20  # None для обработки всего видео, или укажите конкретный кадр для остановки
+    END_FRAME = None # None для обработки всего видео, или укажите конкретный кадр для остановки
     
-    # CONFIG: balanced, sides_short, sides_short_v2, sides_short_v3
-    CONFIG = "custom"
+    # CONFIG: balanced, sides_short, sides_short_v2, sides_short_v3, synthetic
+    CONFIG = "synthetic"
     
     build_map_from_video_4points(
         VIDEO_PATH, 
