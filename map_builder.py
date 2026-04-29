@@ -8,7 +8,8 @@ class LocalMapBuilder:
                  blend_decay=0.05,
                  min_weight=0.1,
                  use_distance_weighting=True,
-                 scale_factor=0.25):
+                 scale_factor=0.25,
+                 use_original_frames=False):
         """
         pixels_per_meter: масштаб карты (пикселей на метр)
         initial_size: начальный размер холста карты
@@ -16,6 +17,7 @@ class LocalMapBuilder:
         min_weight: минимальный вес для обновления пикселя
         use_distance_weighting: использовать взвешивание по расстоянию от машины
         scale_factor: масштаб для сжатия карты без потери точности одометрии
+        use_original_frames: использовать исходные кадры вместо BEV для полной картины
         """
         self.ppm = pixels_per_meter
         self.initial_size = initial_size
@@ -23,6 +25,7 @@ class LocalMapBuilder:
         self.min_weight = min_weight
         self.use_distance_weighting = use_distance_weighting
         self.scale_factor = scale_factor
+        self.use_original_frames = use_original_frames
         
         # Инициализация карты
         self.map = np.zeros((initial_size, initial_size, 3), dtype=np.uint8)
