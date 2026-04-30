@@ -271,10 +271,8 @@ class LocalMapBuilder:
                                      borderMode=cv2.BORDER_REFLECT)
         
         # 2. Создаем маску весов
-        car_pos_in_bev = (w // 2, int(h * 0.85))
-        
         if self.use_distance_weighting:
-            distance_weights = self._create_distance_weight_mask(bev_image.shape, car_pos_in_bev)
+            distance_weights = self._create_distance_weight_mask(bev_image.shape, (w // 2, int(h * 0.85)))
         else:
             distance_weights = np.ones((h, w), dtype=np.float32)
         
@@ -284,8 +282,10 @@ class LocalMapBuilder:
         
         # Полностью вырезаем машину (учитывая масштаб!) только если необходимо
         if mask_car:
-            mask_radius = int(120 * self.scale_factor)
-            cv2.circle(validity_mask, (w // 2, int(h * 0.85)), mask_radius, 0, -1)
+            car_pos_in_bev = (w // 2, int(h * 0.95)) # Опускаем круг вниз
+            mask_radius = int(80 * self.scale_factor)
+            cv2.circle(distance_weights, car_pos_in_bev, mask_radius, 0, -1)
+            cv2.circle(validity_mask, car_pos_in_bev, mask_radius, 0, -1)
         
         # 4. Комбинируем веса
         frame_weights = distance_weights * validity_mask

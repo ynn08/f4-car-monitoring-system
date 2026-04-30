@@ -121,10 +121,34 @@ def build_map_from_video_4points(video_path,
     ])
 
     ipm = IPM_4Points(src_pts, dst_pts, output_size=(bev_width, bev_height))
+
+    # --- Конфигурация BEV ТОЛЬКО ДЛЯ СКЛЕЙКИ (Визуализация) ---
+    # По умолчанию дублируем параметры алгоритма, но их можно настраивать вручную
+    src_pts_map = np.float32([
+        [823 - 223, 535], # Bottom Left 
+        [823 + 223, 535], # Bottom Right
+        [823 - 130, 435], # Top Left    
+        [823 + 130, 435]  # Top Right   
+    ])
+    bev_width_map = 1200
+    bev_height_map = 800
+    ppm_map = 92
+    rect_size_map = (ppm_map, ppm_map * car_size[1] / car_size[0])
+    rect_left_up_pos_map = (bev_width_map // 2 - rect_size_map[0] // 2, bev_height_map * 0.90 - rect_size_map[1])
+
+    dst_pts_map = np.float32([
+        [rect_left_up_pos_map[0], rect_left_up_pos_map[1] + rect_size_map[1]],                   
+        [rect_left_up_pos_map[0] + rect_size_map[0], rect_left_up_pos_map[1] + rect_size_map[1]],   
+        [rect_left_up_pos_map[0], rect_left_up_pos_map[1]],                                  
+        [rect_left_up_pos_map[0] + rect_size_map[0], rect_left_up_pos_map[1]],                   
+    ])
+
+    ipm_map = IPM_4Points(src_pts_map, dst_pts_map, output_size=(bev_width_map, bev_height_map))
+
     builder = None
     if build_global_map:
         builder = LocalMapBuilder(
-            pixels_per_meter=int(ppm / 1.47),      # Синхронизировано с PPM
+            pixels_per_meter=int(ppm_map / 1.47),      # Синхронизировано с PPM для склейки
             initial_size=5000,        # Начальный холст
             blend_decay=0.02,         # Уменьшаем затухание для более плотной карты
             use_distance_weighting=True,
@@ -167,7 +191,7 @@ def build_map_from_video_4points(video_path,
 
         return out
 
-    def build_window_map(frames, max_display_size=(960, 800)):
+    def build_window_map(frames, max_display_size=(1200, 800)):
         valid_frames = [(bev_img, pose, frame_idx) for bev_img, pose, frame_idx in frames if pose is not None]
         if not valid_frames:
             return np.zeros((max_display_size[1], max_display_size[0], 3), dtype=np.uint8)
@@ -177,7 +201,7 @@ def build_map_from_video_4points(video_path,
         sin_a = np.sin(-anchor_pose[2])
 
         preview_builder = LocalMapBuilder(
-            pixels_per_meter=int(ppm / 1.47),
+            pixels_per_meter=int(ppm_map / 1.47),
             initial_size=2500,
             blend_decay=0.02,
             use_distance_weighting=True,
@@ -231,9 +255,9 @@ def build_map_from_video_4points(video_path,
         current_bev = valid_frames[-1][0]
         bev_h, bev_w = current_bev.shape[:2]
         car_center_x_bev = bev_w // 2
-        car_center_y_bev = int(bev_h * 0.85)
+        car_center_y_bev = int(bev_h * 0.95) # Опускаем круг вниз к реальному положению машины
         
-        radius = 120
+        radius = 90 # Точно подобранный радиус под ширину машины
         # Вырезаем область машины из current_bev, учитывая границы
         y1_bev = max(0, car_center_y_bev - radius)
         y2_bev = min(bev_h, car_center_y_bev + radius)
@@ -277,7 +301,7 @@ def build_map_from_video_4points(video_path,
             window_map_video_path,
             cv2.VideoWriter_fourcc(*'mp4v'),
             fps,
-            (960, 800)
+            (1200, 800)
         )
 
     cap = cv2.VideoCapture(video_path)
@@ -298,7 +322,7 @@ def build_map_from_video_4points(video_path,
         cv2.namedWindow("Window Map", cv2.WINDOW_NORMAL)
         cv2.resizeWindow("Matches", 1200, 400)
         cv2.resizeWindow("Sliding Window", 1280, 180)
-        cv2.resizeWindow("Window Map", 960, 540)
+        cv2.resizeWindow("Window Map", 1200, 800)
 
     while True:
         ret, frame = cap.read()
@@ -306,15 +330,18 @@ def build_map_from_video_4points(video_path,
             break
         frame_count += 1
 
-        # 1. IPM трансформация
+        # 1. IPM трансформация для алгоритма
         bev = ipm.transform(frame)
         bev_gray = cv2.cvtColor(bev, cv2.COLOR_BGR2GRAY) if len(bev.shape) == 3 else bev.copy()
+        
+        # 1.1 IPM трансформация для склейки (визуализация)
+        bev_map = ipm_map.transform(frame)
 
         # Сохраняем текущий кадр для скользящего окна
         sliding_frames.append((frame.copy(), frame_count))
 
         # Заготовка для локальной карты окна
-        sliding_bevs.append((bev.copy(), None, frame_count))
+        sliding_bevs.append((bev_map.copy(), None, frame_count))
 
         # 2. Маска машины (для визуализации и отсечения)
         # Вырезаем прямоугольником ровно нижнюю-центральную часть, где торчит нос машины
@@ -350,7 +377,7 @@ def build_map_from_video_4points(video_path,
 
         # 5. Уточнение по карте (только при наличии глобального билдерa)
         if builder is not None:
-            refined_pose, ref_val = builder.refine_pose_against_map(bev, pose, search_range=10)
+            refined_pose, ref_val = builder.refine_pose_against_map(bev_map, pose, search_range=10)
             if ref_val > 0.85:  # Еще немного повысим порог
                 # Проверка на физическую правдоподобность (не прыгаем больше чем на 1 метр за кадр)
                 dist = np.linalg.norm(refined_pose[:2] - pose[:2])
@@ -360,7 +387,7 @@ def build_map_from_video_4points(video_path,
 
         sliding_bevs[-1] = (sliding_bevs[-1][0], pose.copy(), frame_count)
         if builder is not None:
-            builder.add_frame(bev, pose, frame_idx=frame_count)
+            builder.add_frame(bev_map, pose, frame_idx=frame_count)
 
         # 6. Отладочная визуализация
         if debug_mode and show_debug_windows and debug_data is not None:
