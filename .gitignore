@@ -1,0 +1,7 @@
+*.csv
+*.MP4
+*.mp4
+__pycache__
+.venv
+*factor_graph_way
+*skills

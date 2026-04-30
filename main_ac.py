@@ -49,12 +49,101 @@ def load_telemetry(telemetry_path):
         return None
 
 
+def draw_rotated_car(map_img, center, theta, length=50, width=24, color=(0, 255, 0), border_color=(0, 0, 0)):
+    cx, cy = float(center[0]), float(center[1])
+    c, s = np.cos(theta), np.sin(theta)
+    half_length = length / 2.0
+    half_width = width / 2.0
+    corners = np.array([
+        [ half_length,  half_width],
+        [ half_length, -half_width],
+        [-half_length, -half_width],
+        [-half_length,  half_width]
+    ], dtype=np.float32)
+    rot = np.array([[c, -s], [s, c]], dtype=np.float32)
+    pts = np.dot(corners, rot.T) + np.array([cx, cy], dtype=np.float32)
+    pts = np.int32(np.round(pts))
+    cv2.fillPoly(map_img, [pts], color)
+    cv2.polylines(map_img, [pts], True, border_color, 2, lineType=cv2.LINE_AA)
+
+
+def save_side_by_side_video(video_path, builder, output_path, fps, start_frame=0, target_height=None, map_max_width=900):
+    if not os.path.exists(video_path):
+        print(f"Error: Video file '{video_path}' not found!")
+        return
+
+    map_base, crop_offset = builder.get_map_and_crop(crop_to_content=True, draw_trajectory=True)
+    if map_base is None or map_base.size == 0:
+        print("Error: Полученная карта пуста, невозможно собрать видео.")
+        return
+
+    cap = cv2.VideoCapture(video_path)
+    if start_frame > 0:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+
+    orig_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    orig_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    target_height = target_height or orig_height
+
+    scale = target_height / float(map_base.shape[0])
+    scaled_width = int(map_base.shape[1] * scale)
+    if scaled_width > map_max_width:
+        scale = map_max_width / float(map_base.shape[1])
+        scaled_width = int(map_base.shape[1] * scale)
+        target_height = int(map_base.shape[0] * scale)
+
+    map_base_resized = cv2.resize(map_base, (scaled_width, target_height), interpolation=cv2.INTER_AREA)
+    output_width = orig_width + scaled_width
+    output_size = (output_width, target_height)
+
+    writer = cv2.VideoWriter(
+        output_path,
+        cv2.VideoWriter_fourcc(*'mp4v'),
+        fps,
+        output_size
+    )
+
+    print(f"📽 Building side-by-side video: {output_path}")
+    print(f"   Output size: {output_width}x{target_height}, fps={fps}")
+
+    pose_index = 0
+    while True:
+        ret, frame = cap.read()
+        if not ret or pose_index >= len(builder.poses):
+            break
+
+        frame_resized = cv2.resize(frame, (orig_width, target_height), interpolation=cv2.INTER_AREA)
+        map_frame = map_base_resized.copy()
+
+        pose = builder.poses[pose_index]
+        map_x, map_y, theta = builder._pose_to_map_coords(pose)
+        draw_x = int((map_x - crop_offset[0]) * scale)
+        draw_y = int((map_y - crop_offset[1]) * scale)
+        draw_rotated_car(map_frame, (draw_x, draw_y), theta, length=max(24, int(40 * scale)), width=max(16, int(18 * scale)))
+
+        cv2.circle(map_frame, (draw_x, draw_y), max(5, int(6 * scale)), (0, 255, 255), -1)
+        cv2.putText(map_frame, f"Frame {builder.frame_indices[pose_index]}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2, cv2.LINE_AA)
+
+        if target_height != orig_height:
+            frame_resized = cv2.resize(frame, (orig_width, target_height), interpolation=cv2.INTER_AREA)
+
+        combined = np.hstack([frame_resized, map_frame])
+        writer.write(combined)
+        pose_index += 1
+
+    writer.release()
+    cap.release()
+    print(f"✓ Side-by-side video saved to: {output_path}")
+
+
 def build_map_from_video_4points(video_path, 
                                   telemetry_path=None,
                                   output_map_path="local_map.png",
                                   start_frame=0,
                                   end_frame=None,
                                   save_bev_video=False,
+                                  save_side_by_side_video=False,
+                                  side_by_side_video_path=None,
                                   debug_mode=True,          # 🔥 Включить отладку
                                   show_debug_windows=True,  # 🔥 Показывать окна
                                   debug_skip_frames=5,      # 🔥 Показывать каждый N-й кадр
@@ -280,6 +369,10 @@ def build_map_from_video_4points(video_path,
     builder.save_map(output_map_path, draw_trajectory=True)
     print(f"✓ Map saved with trajectory to: {output_map_path}")
 
+    if save_side_by_side_video:
+        side_by_side_video_path = side_by_side_video_path or f"{os.path.splitext(video_path)[0]}_side_by_side.mp4"
+        save_side_by_side_video(video_path, builder, side_by_side_video_path, fps, start_frame=start_frame)
+
     final_map = builder.get_map(draw_trajectory=True)
 
     cv2.imshow("Local Map", final_map)
@@ -326,6 +419,8 @@ if __name__ == "__main__":
         start_frame=START_FRAME, 
         end_frame=END_FRAME,
         save_bev_video=False,
+        save_side_by_side_video=True,
+        side_by_side_video_path="side_by_side_video.mp4",
         debug_mode=True,       # 🔥 Включить отладку
         show_debug_windows=True,# 🔥 Показывать окна
         debug_skip_frames=1,    # 🔥 Каждый N-й кадр

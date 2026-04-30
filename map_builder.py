@@ -247,7 +247,7 @@ class LocalMapBuilder:
             
         return predicted_pose, best_val
 
-    def add_frame(self, bev_image, pose, frame_idx=None):
+    def add_frame(self, bev_image, pose, frame_idx=None, mask_car=True):
         """
         Добавляет кадр на карту с учетом веса и позиции
         """
@@ -278,13 +278,14 @@ class LocalMapBuilder:
         else:
             distance_weights = np.ones((h, w), dtype=np.float32)
         
-        # 3. Маска валидных пикселей (убираем черные края IPM и саму машину)
+        # 3. Маска валидных пикселей (убираем черные края IPM)
         validity_mask = (bev_rotated[:,:,0] > 10) | (bev_rotated[:,:,1] > 10) | (bev_rotated[:,:,2] > 10)
         validity_mask = validity_mask.astype(np.float32)
         
-        # Полностью вырезаем машину (учитывая масштаб!)
-        mask_radius = int(120 * self.scale_factor)
-        cv2.circle(validity_mask, (w // 2, int(h * 0.85)), mask_radius, 0, -1)
+        # Полностью вырезаем машину (учитывая масштаб!) только если необходимо
+        if mask_car:
+            mask_radius = int(120 * self.scale_factor)
+            cv2.circle(validity_mask, (w // 2, int(h * 0.85)), mask_radius, 0, -1)
         
         # 4. Комбинируем веса
         frame_weights = distance_weights * validity_mask
@@ -353,8 +354,8 @@ class LocalMapBuilder:
         
         self.current_pose = pose
 
-    def get_map(self, crop_to_content=True, draw_trajectory=False):
-        """Возвращает итоговую карту"""
+    def get_map_and_crop(self, crop_to_content=True, draw_trajectory=False):
+        """Возвращает карту и смещение обрезки для координат."""
         res_map = self.map.copy()
         
         if draw_trajectory:
@@ -378,9 +379,14 @@ class LocalMapBuilder:
                 y_max = min(res_map.shape[0], y_max + margin)
                 x_max = min(res_map.shape[1], x_max + margin)
                 
-                return res_map[y_min:y_max, x_min:x_max].copy()
+                return res_map[y_min:y_max, x_min:x_max].copy(), (x_min, y_min)
         
-        return res_map
+        return res_map, (0, 0)
+
+    def get_map(self, crop_to_content=True, draw_trajectory=False):
+        """Возвращает итоговую карту"""
+        map_img, _ = self.get_map_and_crop(crop_to_content=crop_to_content, draw_trajectory=draw_trajectory)
+        return map_img
 
     def save_map(self, path, draw_trajectory=True):
         """Сохраняет карту в файл"""
@@ -389,6 +395,16 @@ class LocalMapBuilder:
         print(f"💾 Map saved: {path} ({map_to_save.shape[1]}x{map_to_save.shape[0]})")
 
     def get_trajectory(self):
+        """Возвращает траекторию в координатах карты"""
+        trajectory = []
+        for pose in self.poses:
+            map_x, map_y, _ = self._pose_to_map_coords(pose)
+            trajectory.append((map_x, map_y))
+        return np.array(trajectory)
+
+    def clear_cache(self):
+        """Очищает кэш весовых масок"""
+        self._distance_weight_cache.clear()
         """Возвращает траекторию в координатах карты"""
         trajectory = []
         for pose in self.poses:

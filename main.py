@@ -56,6 +56,11 @@ def build_map_from_video_4points(video_path,
                                   start_frame=0,
                                   end_frame=None,
                                   save_bev_video=False,
+                                  save_window_map_video=False,
+                                  window_map_video_path=None,
+                                  save_window_map_image=False,
+                                  window_map_image_path=None,
+                                  build_global_map=False,
                                   debug_mode=True,          # 🔥 Включить отладку
                                   show_debug_windows=True,  # 🔥 Показывать окна
                                   debug_skip_frames=5,      # 🔥 Показывать каждый N-й кадр
@@ -116,14 +121,16 @@ def build_map_from_video_4points(video_path,
     ])
 
     ipm = IPM_4Points(src_pts, dst_pts, output_size=(bev_width, bev_height))
-    builder = LocalMapBuilder(
-        pixels_per_meter=int(ppm / 1.47),      # Синхронизировано с PPM
-        initial_size=5000,        # Начальный холст
-        blend_decay=0.02,         # Уменьшаем затухание для более плотной карты
-        use_distance_weighting=True,
-        scale_factor=1        # Увеличиваем разрешение карты в 2 раза
-    )
-    
+    builder = None
+    if build_global_map:
+        builder = LocalMapBuilder(
+            pixels_per_meter=int(ppm / 1.47),      # Синхронизировано с PPM
+            initial_size=5000,        # Начальный холст
+            blend_decay=0.02,         # Уменьшаем затухание для более плотной карты
+            use_distance_weighting=True,
+            scale_factor=1        # Увеличиваем разрешение карты в 2 раза
+        )
+
     use_telemetry = telemetry_path is not None
     vo = VisualOdometryIPM(
         use_telemetry=use_telemetry,
@@ -131,8 +138,8 @@ def build_map_from_video_4points(video_path,
         config_mode=config_mode
     )
 
-    sliding_frames = deque(maxlen=5)
-    sliding_bevs = deque(maxlen=5)
+    sliding_frames = deque(maxlen=6)
+    sliding_bevs = deque(maxlen=6)
 
     def build_sliding_strip(frames, cell_size=(256, 144)):
         visible = len(frames)
@@ -160,12 +167,12 @@ def build_map_from_video_4points(video_path,
 
         return out
 
-    def build_window_map(frames, max_display_size=(960, 540)):
+    def build_window_map(frames, max_display_size=(960, 800)):
         valid_frames = [(bev_img, pose, frame_idx) for bev_img, pose, frame_idx in frames if pose is not None]
         if not valid_frames:
             return np.zeros((max_display_size[1], max_display_size[0], 3), dtype=np.uint8)
 
-        anchor_pose = valid_frames[0][1]
+        anchor_pose = valid_frames[-1][1]
         cos_a = np.cos(-anchor_pose[2])
         sin_a = np.sin(-anchor_pose[2])
 
@@ -177,6 +184,7 @@ def build_map_from_video_4points(video_path,
             scale_factor=1
         )
 
+        current_frame_idx = valid_frames[-1][2]
         for bev_img, pose, frame_idx in valid_frames:
             dx = pose[0] - anchor_pose[0]
             dy = pose[1] - anchor_pose[1]
@@ -184,25 +192,94 @@ def build_map_from_video_4points(video_path,
             local_y = dx * sin_a + dy * cos_a
             local_theta = pose[2] - anchor_pose[2]
             local_pose = np.array([local_x, local_y, local_theta], dtype=np.float32)
-            preview_builder.add_frame(bev_img, local_pose, frame_idx=frame_idx)
+            preview_builder.add_frame(
+                bev_img,
+                local_pose,
+                frame_idx=frame_idx,
+                mask_car=(frame_idx != current_frame_idx)
+            )
 
-        preview_map = preview_builder.get_map(crop_to_content=True, draw_trajectory=True)
-        if preview_map is None or preview_map.size == 0:
-            return np.zeros((max_display_size[1], max_display_size[0], 3), dtype=np.uint8)
+        full_map = preview_builder.map
+        out_w, out_h = max_display_size
+        
+        car_out_x = out_w // 2
+        car_out_y = int(out_h * 0.50)
+        
+        car_map_x = preview_builder.center_x
+        car_map_y = preview_builder.center_y
+        
+        start_x = car_map_x - car_out_x
+        start_y = car_map_y - car_out_y
+        
+        canvas = np.zeros((out_h, out_w, 3), dtype=np.uint8)
+        map_h, map_w = full_map.shape[:2]
+        
+        src_x1 = max(0, start_x)
+        src_y1 = max(0, start_y)
+        src_x2 = min(map_w, start_x + out_w)
+        src_y2 = min(map_h, start_y + out_h)
+        
+        dst_x1 = max(0, -start_x)
+        dst_y1 = max(0, -start_y)
+        dst_x2 = dst_x1 + (src_x2 - src_x1)
+        dst_y2 = dst_y1 + (src_y2 - src_y1)
+        
+        if src_x2 > src_x1 and src_y2 > src_y1:
+            canvas[dst_y1:dst_y2, dst_x1:dst_x2] = full_map[src_y1:src_y2, src_x1:src_x2]
 
-        h, w = preview_map.shape[:2]
-        scale = min(max_display_size[0] / max(w, 1), max_display_size[1] / max(h, 1), 1.0)
-        if scale < 1.0:
-            preview_map = cv2.resize(preview_map, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
+        # Отрисовка текущей машины абсолютно четко и непрозрачно
+        current_bev = valid_frames[-1][0]
+        bev_h, bev_w = current_bev.shape[:2]
+        car_center_x_bev = bev_w // 2
+        car_center_y_bev = int(bev_h * 0.85)
+        
+        radius = 120
+        # Вырезаем область машины из current_bev, учитывая границы
+        y1_bev = max(0, car_center_y_bev - radius)
+        y2_bev = min(bev_h, car_center_y_bev + radius)
+        x1_bev = max(0, car_center_x_bev - radius)
+        x2_bev = min(bev_w, car_center_x_bev + radius)
+        
+        car_patch = current_bev[y1_bev:y2_bev, x1_bev:x2_bev]
+        
+        # Смещение относительно идеального центра, если вышли за границы BEV
+        dy_off = y1_bev - (car_center_y_bev - radius)
+        dx_off = x1_bev - (car_center_x_bev - radius)
+        
+        # Вставляем на canvas (где центр машины - car_out_x, car_out_y)
+        y1_canv = car_out_y - radius + dy_off
+        y2_canv = y1_canv + (y2_bev - y1_bev)
+        x1_canv = car_out_x - radius + dx_off
+        x2_canv = x1_canv + (x2_bev - x1_bev)
+        
+        # Создаем маску круга и обрезаем ее под размер патча
+        mask_full = np.zeros((radius*2, radius*2), dtype=np.uint8)
+        cv2.circle(mask_full, (radius, radius), radius, 255, -1)
+        mask = mask_full[dy_off : dy_off + (y2_bev - y1_bev), dx_off : dx_off + (x2_bev - x1_bev)]
+        
+        # Безопасная вставка на canvas
+        if y1_canv >= 0 and y2_canv <= out_h and x1_canv >= 0 and x2_canv <= out_w:
+            for c in range(3):
+                canvas_roi = canvas[y1_canv:y2_canv, x1_canv:x2_canv, c]
+                patch_roi = (car_patch[:, :, c].astype(np.float32) * 1.2).clip(0, 255).astype(np.uint8)
+                canvas[y1_canv:y2_canv, x1_canv:x2_canv, c] = np.where(mask == 255, patch_roi, canvas_roi)
 
-        canvas = np.zeros((max_display_size[1], max_display_size[0], 3), dtype=np.uint8)
-        canvas[:preview_map.shape[0], :preview_map.shape[1]] = preview_map
-        cv2.putText(canvas, f"Window map from last {len(valid_frames)} frames", (10, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2, cv2.LINE_AA)
         return canvas
 
     telemetry_data = load_telemetry(telemetry_path) if telemetry_path else None
 
     bevs = []
+    window_map_writer = None
+    if save_window_map_video:
+        if window_map_video_path is None:
+            window_map_video_path = f"{os.path.splitext(video_path)[0]}_window_map.mp4"
+        window_map_writer = cv2.VideoWriter(
+            window_map_video_path,
+            cv2.VideoWriter_fourcc(*'mp4v'),
+            fps,
+            (960, 800)
+        )
+
     cap = cv2.VideoCapture(video_path)
     if start_frame > 0:
         cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
@@ -271,17 +348,19 @@ def build_map_from_video_4points(video_path,
         # 4. Визуальная одометрия
         pose, debug_data = vo.update(bev, telemetry=current_telemetry)
 
-        # 5. Уточнение по карте
-        refined_pose, ref_val = builder.refine_pose_against_map(bev, pose, search_range=10)
-        if ref_val > 0.85:  # Еще немного повысим порог
-            # Проверка на физическую правдоподобность (не прыгаем больше чем на 1 метр за кадр)
-            dist = np.linalg.norm(refined_pose[:2] - pose[:2])
-            if dist < 80:  # ~0.8-0.9 метра при ppm=92
-                alpha = 0.15
-                pose = (1.0 - alpha) * pose + alpha * refined_pose
+        # 5. Уточнение по карте (только при наличии глобального билдерa)
+        if builder is not None:
+            refined_pose, ref_val = builder.refine_pose_against_map(bev, pose, search_range=10)
+            if ref_val > 0.85:  # Еще немного повысим порог
+                # Проверка на физическую правдоподобность (не прыгаем больше чем на 1 метр за кадр)
+                dist = np.linalg.norm(refined_pose[:2] - pose[:2])
+                if dist < 80:  # ~0.8-0.9 метра при ppm=92
+                    alpha = 0.15
+                    pose = (1.0 - alpha) * pose + alpha * refined_pose
 
         sliding_bevs[-1] = (sliding_bevs[-1][0], pose.copy(), frame_count)
-        builder.add_frame(bev, pose, frame_idx=frame_count)
+        if builder is not None:
+            builder.add_frame(bev, pose, frame_idx=frame_count)
 
         # 6. Отладочная визуализация
         if debug_mode and show_debug_windows and debug_data is not None:
@@ -308,6 +387,10 @@ def build_map_from_video_4points(video_path,
                 elif key == ord(' '):
                     cv2.waitKey(0)
 
+        if window_map_writer is not None:
+            window_frame = build_window_map(list(sliding_bevs))
+            window_map_writer.write(window_frame)
+
         if save_bev_video:
             bevs.append(bev)
 
@@ -327,7 +410,7 @@ def build_map_from_video_4points(video_path,
     print(f"  Successful matches: {stats['successful_matches']}")
     print(f"  Success rate: {stats['successful_matches']/max(1, stats['total_frames'])*100:.1f}%")
     print(f"  Avg matches per frame: {stats['avg_matches']:.1f}")
-    print(f"  Map-to-Frame Refinements: {builder.refinement_count}")
+    print(f"  Map-to-Frame Refinements: {builder.refinement_count if builder is not None else 0}")
     print(f"{'='*60}\n")
 
     if save_bev_video:
@@ -340,35 +423,50 @@ def build_map_from_video_4points(video_path,
             ipm_video.write(bev)
         ipm_video.release()
 
-    builder.save_map(output_map_path, draw_trajectory=True)
-    print(f"✓ Map saved with trajectory to: {output_map_path}")
+    if window_map_writer is not None:
+        window_map_writer.release()
+        print(f"✓ Window map video saved to: {window_map_video_path}")
 
-    final_map = builder.get_map(draw_trajectory=True)
+    if save_window_map_image:
+        window_map_image_path = window_map_image_path or f"{os.path.splitext(video_path)[0]}_window_map.png"
+        final_window_map = build_window_map(list(sliding_bevs))
+        cv2.imwrite(window_map_image_path, final_window_map)
+        print(f"✓ Window map saved to: {window_map_image_path}")
 
-    cv2.imshow("Local Map", final_map)
-    cv2.waitKey(0)
-    cv2.destroyAllWindows()
-    
-    print(f"\n📈 FINAL STATISTICS:")
-    print(f"  Frames processed: {frame_count - start_frame}")
-    print(f"  Map size: {final_map.shape[1]}x{final_map.shape[0]} pixels")
-    print(f"  Trajectory points: {len(builder.poses)}")
-    
-    # Сохраняем траекторию
-    trajectory_file = "trajectory.json"
-    trajectory_data = []
-    for i in range(len(builder.poses)):
-        p = builder.poses[i]
-        trajectory_data.append({
-            'frame': int(builder.frame_indices[i]),
-            'x': float(p[0]),
-            'y': float(p[1]),
-            'theta': float(p[2])
-        })
-    
-    with open(trajectory_file, 'w') as f:
-        json.dump(trajectory_data, f, indent=4)
-    print(f"✓ Trajectory saved to: {trajectory_file}")
+    if builder is not None:
+        builder.save_map(output_map_path, draw_trajectory=True)
+        print(f"✓ Map saved with trajectory to: {output_map_path}")
+
+        final_map = builder.get_map(draw_trajectory=True)
+
+        cv2.imshow("Local Map", final_map)
+        cv2.waitKey(0)
+        cv2.destroyAllWindows()
+        
+        print(f"\n📈 FINAL STATISTICS:")
+        print(f"  Frames processed: {frame_count - start_frame}")
+        print(f"  Map size: {final_map.shape[1]}x{final_map.shape[0]} pixels")
+        print(f"  Trajectory points: {len(builder.poses)}")
+        
+        # Сохраняем траекторию
+        trajectory_file = "trajectory.json"
+        trajectory_data = []
+        for i in range(len(builder.poses)):
+            p = builder.poses[i]
+            trajectory_data.append({
+                'frame': int(builder.frame_indices[i]),
+                'x': float(p[0]),
+                'y': float(p[1]),
+                'theta': float(p[2])
+            })
+        
+        with open(trajectory_file, 'w') as f:
+            json.dump(trajectory_data, f, indent=4)
+        print(f"✓ Trajectory saved to: {trajectory_file}")
+    else:
+        print(f"\n📈 FINAL STATISTICS:")
+        print(f"  Frames processed: {frame_count - start_frame}")
+        print(f"  Global map building disabled.")
 
 
 if __name__ == "__main__":
@@ -393,4 +491,6 @@ if __name__ == "__main__":
         show_debug_windows=True,# 🔥 Показывать окна
         debug_skip_frames=1,    # 🔥 Каждый N-й кадр
         config_mode=CONFIG,     # 🔥 Конфигурация масок
+        save_window_map_video=True,
+        window_map_video_path="window_map.mp4",
     )
